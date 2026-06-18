@@ -1,0 +1,10 @@
+export const AUTH_RECORDING_MAX_MS = 6_000
+export const CHAT_RECORDING_MAX_MS = 20_000
+export const AUTH_MAX_ATTEMPTS = 3
+export const AUTH_LOCKOUT_MS = 5 * 60 * 1000   // 5 minutes
+export const SESSION_TTL_MS = 4 * 60 * 60 * 1000         // 4 hours
+export const SESSION_REMEMBER_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+export const SPEAKER_THRESHOLD_DEFAULT = 0.75
+export const AUDIO_MAX_BYTES = 50 * 1024 * 1024  // 50 MB
+export const ENROLLMENT_MIN_CLIPS = 3
+export const ENROLLMENT_MAX_CLIPS = 5

@@ -1,0 +1,39 @@
+{
+  "name": "server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "node --env-file=.env --import tsx/esm --watch src/index.ts",
+    "build": "tsc --project tsconfig.json",
+    "start": "node dist/index.js",
+    "gen-secret": "node -e \"process.stdout.write(require('crypto').randomBytes(32).toString('hex') + '\\n')\"",
+    "hash-password": "node --input-type=module -e \"import { PasscodeService } from '@axel/auth'; const pw = process.argv[2]; if (!pw) { console.error('Usage: pnpm hash-password <password>'); process.exit(1); } new PasscodeService().hash(pw).then(h => console.log(h)).catch(e => { console.error(e.message); process.exit(1); })\" --"
+  },
+  "dependencies": {
+    "@axel/agent": "workspace:*",
+    "@axel/auth": "workspace:*",
+    "@axel/core": "workspace:*",
+    "@axel/stt": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cookie": "^1.1.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "express": "^5.0.1",
+    "multer": "^1.4.5-lts.1",
+    "node-pty": "^1.1.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/cookie": "^1.0.0",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4"
+  }
+}

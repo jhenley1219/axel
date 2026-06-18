@@ -1,0 +1,50 @@
+# Public Dockerfile for Axel — used by `npx axel-docker-init` and by anyone
+# running `docker compose -f docker-compose.public.yml up`.
+# Builds Axel from source, bakes in Node, Python TTS engines, and the Claude
+# Code CLI. Credentials are never baked in; users sign in on first run.
+
+# Stage 1: Node build
+FROM node:22-slim AS node-build
+RUN npm install -g pnpm@10.33.0
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
+COPY packages/ packages/
+COPY apps/ apps/
+RUN pnpm install --no-frozen-lockfile --shamefully-hoist
+RUN pnpm -r run build
+RUN rm -f node_modules/@axel/core node_modules/@axel/agent node_modules/@axel/auth node_modules/@axel/stt && \
+    cp -r packages/core node_modules/@axel/core && \
+    cp -r packages/agent node_modules/@axel/agent && \
+    cp -r packages/auth node_modules/@axel/auth && \
+    cp -r packages/stt node_modules/@axel/stt
+
+# Stage 2: Runtime
+FROM node:22-slim AS runtime
+RUN apt-get update && apt-get install -y python3 python3-pip gosu git curl --no-install-recommends && rm -rf /var/lib/apt/lists/*
+COPY python/requirements.txt /tmp/requirements.txt
+RUN pip3 install -r /tmp/requirements.txt --no-cache-dir --break-system-packages
+RUN python3 -c "import piper, kokoro_onnx; print('[build] tts engines ok')"
+# Local TTS models baked into the image (~460MB) — kept out of git and the
+# build context, so they must be fetched here
+RUN mkdir -p /app/python/models/piper /app/python/models/kokoro && \
+    python3 -m piper.download_voices en_US-amy-medium en_US-ryan-medium --data-dir /app/python/models/piper && \
+    curl -fL -o /app/python/models/kokoro/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx && \
+    curl -fL -o /app/python/models/kokoro/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+RUN npm install -g @anthropic-ai/claude-code && which claude && claude --version
+ENV CLAUDE_PATH=/usr/local/bin/claude
+RUN useradd -r -m -d /home/axel -s /bin/false axel && \
+    mkdir -p /data/embeddings /data/audit /data/models /projects && \
+    chown -R axel:axel /data /projects
+ENV HOME=/home/axel
+WORKDIR /app
+COPY --from=node-build /app/apps/server/dist ./dist
+COPY --from=node-build /app/apps/web/dist ./public
+COPY --from=node-build /app/node_modules ./node_modules
+COPY python/ ./python/
+COPY docker-entrypoint.public.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+VOLUME ["/data/embeddings", "/data/audit", "/data/models"]
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s CMD node -e "require('http').get('http://localhost:8080/healthz', r => process.exit(r.statusCode === 200 ? 0 : 1))"
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node", "dist/index.js"]

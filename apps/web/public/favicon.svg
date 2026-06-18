@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <radialGradient id="lime"   cx="30%" cy="32%" r="38%"><stop offset="0%" stop-color="#c9ff2e"/><stop offset="100%" stop-color="#c9ff2e" stop-opacity="0"/></radialGradient>
+    <radialGradient id="orange" cx="70%" cy="30%" r="40%"><stop offset="0%" stop-color="#ff6a1a"/><stop offset="100%" stop-color="#ff6a1a" stop-opacity="0"/></radialGradient>
+    <radialGradient id="pink"   cx="68%" cy="70%" r="40%"><stop offset="0%" stop-color="#ff2f86"/><stop offset="100%" stop-color="#ff2f86" stop-opacity="0"/></radialGradient>
+    <radialGradient id="cyan"   cx="30%" cy="68%" r="38%"><stop offset="0%" stop-color="#33ffe0"/><stop offset="100%" stop-color="#33ffe0" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glow"   cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#f3eee2" stop-opacity=".2"/><stop offset="60%" stop-color="#f3eee2" stop-opacity="0"/></radialGradient>
+    <clipPath id="orb"><circle cx="32" cy="32" r="29"/></clipPath>
+  </defs>
+
+  <!-- Outer dark backdrop with subtle vignette -->
+  <circle cx="32" cy="32" r="31" fill="#0c0c0e"/>
+
+  <!-- Four overlapping color blobs, screen-blended inside the orb circle.
+       The radial gradients fade to transparent at their edges, so where they
+       overlap they additively brighten — same effect as the in-app .ax-blob
+       elements with mix-blend-mode:screen, just baked into static SVG. -->
+  <g clip-path="url(#orb)" style="mix-blend-mode:screen">
+    <rect x="0" y="0" width="64" height="64" fill="url(#lime)"/>
+    <rect x="0" y="0" width="64" height="64" fill="url(#orange)"/>
+    <rect x="0" y="0" width="64" height="64" fill="url(#pink)"/>
+    <rect x="0" y="0" width="64" height="64" fill="url(#cyan)"/>
+    <rect x="0" y="0" width="64" height="64" fill="url(#glow)"/>
+  </g>
+
+  <!-- Faint cream rim to define the silhouette at very small sizes -->
+  <circle cx="32" cy="32" r="29" fill="none" stroke="#f3eee2" stroke-opacity=".22" stroke-width="1"/>
+</svg>

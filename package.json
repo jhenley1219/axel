@@ -1,0 +1,57 @@
+{
+  "name": "axel",
+  "version": "1.0.0",
+  "description": "Self-hosted voice AI agent for your projects",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/jhenley1219/axel#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jhenley1219/axel.git"
+  },
+  "bugs": "https://github.com/jhenley1219/axel/issues",
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "voice",
+    "self-hosted",
+    "mcp"
+  ],
+  "bin": {
+    "axel": "./bin/axel.js",
+    "axel-docker-init": "./bin/axel-docker-init.js"
+  },
+  "files": [
+    "bin/",
+    "apps/server/dist/",
+    "apps/server/public/",
+    "apps/server/node_modules/@axel/",
+    "apps/server/package.json",
+    "packages/*/dist/",
+    "packages/*/package.json",
+    "python/",
+    "scripts/"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "argon2",
+      "esbuild",
+      "node-pty"
+    ]
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"pnpm --filter server dev\" \"pnpm --filter web dev\"",
+    "build": "pnpm -r run build && node scripts/postbuild.mjs",
+    "start": "node bin/axel.js",
+    "install:python": "pip3 install -r python/requirements.txt"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "playwright": "^1.60.0",
+    "typescript": "^5.5.4"
+  }
+}
