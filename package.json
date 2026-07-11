@@ -1,6 +1,6 @@
 {
   "name": "axel",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Self-hosted voice AI agent for your projects",
   "type": "module",
   "license": "MIT",

@@ -2,6 +2,12 @@
 
 All notable changes to Axel are documented here.
 
+## [1.1.1] — 2026-07-11
+
+### Fixed
+
+- **Docker runtime missing `@axel/observability`.** The `Dockerfile.public` build stage replaces hoisted workspace symlinks with real copies before the runtime stage; the new `@axel/observability` package was missing from that list, leaving a dangling symlink in the runtime image and crashing the server at startup with `ERR_MODULE_NOT_FOUND`. Source (non-Docker) installs were unaffected.
+
 ## [1.1.0] — 2026-07-10
 
 ### Added
