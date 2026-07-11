@@ -103,16 +103,20 @@ flowchart BT
     auth[packages/auth]
     stt[packages/stt]
     agent[packages/agent]
+    obs[packages/observability]
     server[apps/server]
     web[apps/web]
 
     auth --> core
     stt --> core
     agent --> core
+    obs --> core
+    obs --> agent
     server --> core
     server --> auth
     server --> stt
     server --> agent
+    server --> obs
     web -. "HTTP + WS (AgentWireMessage)" .-> server
 ```
 
@@ -140,6 +144,9 @@ The orchestration layer.
 
 ### `@axel/stt`
 Type-only `STTProvider` interface — a seam for a future server-side STT engine. No concrete implementation is wired in; speech-to-text runs in the browser.
+
+### `@axel/observability`
+Append-only per-session interaction recorder plus a read layer for diagnosing UI-vs-backend divergence. `ObservabilityRecorder` writes a chronological JSONL feed (user/control inputs, every `AgentWireMessage`, raw model turns from the `axel` runtime, throttled UI-state snapshots) under `OBSERVABILITY_DIR`; `SessionReader`/`reconstruct`/`diffUiVsBackend` read it back, and a read-only stdio MCP server (`axel-observe-mcp` bin) exposes the same views to an external debugging agent. Recording is on by default (local disk only) and disabled with `OBSERVABILITY_ENABLED=false`.
 
 ### `apps/server`
 Express 5 + `ws`.

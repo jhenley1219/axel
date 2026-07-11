@@ -1,0 +1,23 @@
+{
+  "name": "@axel/observability",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "axel-observe-mcp": "./dist/mcp/bin.js"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch"
+  },
+  "dependencies": {
+    "@axel/agent": "workspace:*",
+    "@axel/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.4"
+  }
+}

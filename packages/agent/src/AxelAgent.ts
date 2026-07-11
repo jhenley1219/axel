@@ -7,9 +7,11 @@ import type { PermissionBroker } from './PermissionBroker.js'
 import { composeSystemPrompt, type Tier } from './promptTiers.js'
 import type { ModelProvider } from './providers/Provider.js'
 import type { TerminalOpenHandler } from './TerminalBroker.js'
+import type { TerminalReadHandler } from './TerminalReadBroker.js'
 import type { FileOpenHandler } from './FileOpenBroker.js'
 import type { CleanupHandler } from './CleanupBroker.js'
-import type { ToolContext, ToolRegistry } from './tools/index.js'
+import type { QueueSpawnRole } from './RequestQueue.js'
+import { buildRootOrchestrationTools, type Tool, type ToolContext, type ToolRegistry } from './tools/index.js'
 
 const MAX_TOOL_LOOP_ITERATIONS = 25
 
@@ -21,12 +23,26 @@ const defaultModel = (name: ModelProvider['name']): string => {
   }
 }
 
+// Emitted once per provider-stream iteration so observers can compare the raw
+// text the model produced against the tool calls actually parsed out of it.
+export type AxelTurnRecord = {
+  iteration: number
+  rawModelOutput: string
+  parsedToolCalls: Array<ToolCall>
+  model: string
+  provider: string
+  tier: string
+}
+
 export type AxelAgentDeps = {
   registry: ToolRegistry
   sessionStore: SessionStore
   permissionBroker: PermissionBroker
   getPermissionMode: () => PermissionMode
   getTier: () => Tier
+  // Optional turn observer (wired to @axel/observability in the server). When
+  // unset the agent behaves identically — zero overhead, no behavior change.
+  onTurn?: (axelSessionId: string, rec: AxelTurnRecord) => void
 }
 
 export class AxelAgent implements AgentRuntime {
@@ -51,12 +67,22 @@ export class AxelAgent implements AgentRuntime {
     terminalHandler?: TerminalOpenHandler,
     fileHandler?: FileOpenHandler,
     cleanupHandler?: CleanupHandler,
+    queueRole?: QueueSpawnRole,
+    terminalReadHandler?: TerminalReadHandler,
   ): Promise<string | undefined> {
     void runtimeSessionId       // axel uses axelSessionId as the conv key
-    void terminalHandler        // open_terminal lives outside the tool registry for now
     void fileHandler            // axel opens files via its own ui_open_file tool, not the broker
-    void cleanupHandler         // close_idle_dirs is a claude-code-only capability
     void onAuthUrl              // providers don't surface interactive OAuth
+
+    // The local model acts as the root controller: it socializes with the user
+    // and delegates project work by spawning sub-terminals of itself. Those
+    // capabilities are the terminal/read/cleanup handlers the orchestrator
+    // passes here — exposed as real tools only on the root spawn so the model
+    // can CALL open_terminal instead of describing it in text.
+    const isRoot = queueRole?.role === 'root'
+    const orchestrationTools: Array<Tool> = isRoot
+      ? buildRootOrchestrationTools({ open: terminalHandler, read: terminalReadHandler, cleanup: cleanupHandler })
+      : []
 
     await this.logger.log({
       type: 'execute',
@@ -72,7 +98,13 @@ export class AxelAgent implements AgentRuntime {
     const conv = this.deps.sessionStore.get(axelSessionId)
     conv.addUser(userMessage)
 
-    const tools = this.deps.registry.list().map(t => ({
+    // Root controller delegates ALL project work — it gets ONLY the
+    // orchestration tools, never the file/search/bash tools (those would tempt
+    // it to do work inline instead of handing off). A worker/child spawn gets
+    // the file tools to actually do the task.
+    const activeTools: Array<Tool> = isRoot ? orchestrationTools : this.deps.registry.list()
+    const toolByName = new Map(activeTools.map(t => [t.name, t]))
+    const tools = activeTools.map(t => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
@@ -114,6 +146,15 @@ export class AxelAgent implements AgentRuntime {
 
       conv.addAssistant(assistantText, toolCalls.length > 0 ? toolCalls : undefined)
 
+      this.deps.onTurn?.(axelSessionId, {
+        iteration: iter,
+        rawModelOutput: assistantText,
+        parsedToolCalls: toolCalls,
+        model,
+        provider: provider.name,
+        tier: this.deps.getTier(),
+      })
+
       if (toolCalls.length === 0) {
         onEvent({ type: 'message_end' })
         return randomUUID()
@@ -135,7 +176,7 @@ export class AxelAgent implements AgentRuntime {
             continue
           }
         }
-        const tool = this.deps.registry.get(call.name)
+        const tool = toolByName.get(call.name)
         if (!tool) {
           conv.addToolResult(call.id, 'unknown tool: ' + call.name)
           continue

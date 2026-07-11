@@ -29,20 +29,21 @@ mcpTerminalRouter.post('/mcp/terminal/:spawnId', async (req, res) => {
     tools: [{
       name: 'open_terminal',
       description:
-        'Open OR reuse a project terminal. If the BACKGROUND TERMINALS section already lists a terminal in the dir you want and you have a follow-up task for it, pass that terminal\'s [t-xxxxxxxx] id as `term` — the prompt goes to the SAME claude conversation, the SAME visible tab. Same dir + new task with NO `term` opens a NEW tab; do that only when you genuinely need parallel work in that dir. Pass `prompt` to start work immediately, or omit it to just open an empty tab.',
+        'Send a task to a project terminal — and by DEFAULT continue the one that is already open. If a terminal exists for the directory (shown in BACKGROUND TERMINALS, including the user\'s "main" terminal), your `prompt` goes into that SAME claude conversation, SAME tab, keeping full context — that is how you send a follow-up, answer its question, or give it the next step. Pass `term` to target a specific terminal by its [id] (e.g. "main" or "t-xxxxxxxx"). Pass `new: true` ONLY when the user explicitly wants a separate terminal for parallel work on something else — never just to relay a follow-up. Omit `prompt` to just focus/open a tab.',
       inputSchema: {
         type: 'object',
         properties: {
-          directory: { type: 'string', description: 'Project directory name under the projects root. Omit to open in the current project.' },
-          prompt: { type: 'string', description: 'Optional task for the terminal to start on immediately.' },
-          term: { type: 'string', description: 'Optional. The [t-xxxxxxxx] id of an existing terminal in this dir, taken from the BACKGROUND TERMINALS section. Setting this reuses that terminal (same conversation, same tab) instead of spawning a new PTY. If the id no longer matches a live PTY the call silently falls back to opening a fresh terminal — no error.' },
+          directory: { type: 'string', description: 'Project directory name under the projects root. Omit to use the current project.' },
+          prompt: { type: 'string', description: 'The task/message to send. Goes into the target\'s existing terminal by default.' },
+          term: { type: 'string', description: 'Optional. The [id] of the terminal to send to — "main" (the user\'s own terminal) or a [t-xxxxxxxx] id from BACKGROUND TERMINALS. Reuses that exact conversation. Omit to use the directory\'s current terminal.' },
+          new: { type: 'boolean', description: 'Set true to force a brand-new terminal instead of reusing the current one. ONLY for explicit parallel work on something separate — not for follow-ups.' },
         },
       },
     }],
   }))
 
   server.setRequestHandler(CallToolRequestSchema, async request => {
-    const args = (request.params.arguments ?? {}) as { directory?: string; prompt?: string; term?: string }
+    const args = (request.params.arguments ?? {}) as { directory?: string; prompt?: string; term?: string; new?: boolean }
     const result = await terminalBroker.open(spawnId, args)
     return { content: [{ type: 'text', text: JSON.stringify(result) }] }
   })

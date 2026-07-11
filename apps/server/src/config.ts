@@ -83,6 +83,17 @@ export const config = {
       ? resolve(workspaceRoot, '.axel/mcp-registry')
       : path.join(homedir(), '.axel', 'mcp-registry'),
 
+  // observabilityDir: per-session interaction recordings (UI snapshots +
+  // backend conversation feed) the axel-observe MCP server reads back.
+  observabilityDir: process.env.OBSERVABILITY_DIR
+    ? resolve(process.env.OBSERVABILITY_DIR)
+    : workspaceRoot
+      ? resolve(workspaceRoot, 'data/observability')
+      : resolve('./data/observability'),
+
+  // OBSERVABILITY_ENABLED=false turns off recording entirely.
+  observabilityEnabled: process.env.OBSERVABILITY_ENABLED !== 'false',
+
   pythonPath: process.env.PYTHON_PATH ?? 'python3',
   pythonScriptDir: process.env.PYTHON_SCRIPT_DIR
     ? resolve(process.env.PYTHON_SCRIPT_DIR)

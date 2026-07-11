@@ -29,6 +29,9 @@ importers:
       '@axel/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@axel/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
       '@axel/stt':
         specifier: workspace:*
         version: link:../../packages/stt
@@ -176,6 +179,25 @@ importers:
         version: 5.9.3
 
   packages/core:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.20
+      typescript:
+        specifier: ^5.5.4
+        version: 5.9.3
+
+  packages/observability:
+    dependencies:
+      '@axel/agent':
+        specifier: workspace:*
+        version: link:../agent
+      '@axel/core':
+        specifier: workspace:*
+        version: link:../core
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.29.0
+        version: 1.29.0(zod@4.4.3)
     devDependencies:
       '@types/node':
         specifier: ^22.0.0

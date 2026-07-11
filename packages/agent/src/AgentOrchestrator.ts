@@ -11,7 +11,8 @@ import type { FileOpenHandler } from './FileOpenBroker.js'
 import type { CleanupHandler } from './CleanupBroker.js'
 import { McpRegistry } from './McpRegistry.js'
 import { PromptBuilder } from './PromptBuilder.js'
-import { listProjects } from './projects.js'
+import { readClaudeTranscript } from './ClaudeTranscript.js'
+import { stat } from 'node:fs/promises'
 
 export type OrchestratorOpts = {
   projectsDir: string      // cwd for runtime invocations — common parent of all projects
@@ -28,7 +29,16 @@ export type OrchestratorOpts = {
   // session that triggered the request. The web client answers via the existing
   // `permission_response` control channel routed back through broker.resolve().
   permissionBroker?: PermissionBroker
+  // Resolved per-call. True when the active runtime is a small local model
+  // (q4-local / q2-local tier) that needs the compact PromptBuilder prompt
+  // instead of the full ~17k-char Claude prompt. Defaults to false.
+  isCompactModel?: () => boolean
 }
+
+// Cap on a single read_terminal result. The full conversation always exists on
+// disk; when it exceeds this we return the most recent slice with a marker so
+// the root's context isn't blown by one enormous terminal. Generous by default.
+const TERMINAL_READ_MAX_CHARS = Number(process.env.AXEL_TERMINAL_READ_MAX_CHARS ?? 80_000)
 
 type TaggedEvent = AgentEvent & { target?: string; term?: string }
 type FanOutEvent =
@@ -37,105 +47,12 @@ type FanOutEvent =
   | { type: 'target_done'; target: string; term?: string }
   | { type: 'error'; message: string; target?: string; term?: string }
 
-// Score one project against the message. Higher = more confident the user
-// meant this directory. Tiers (ordered, first hit wins):
-//   100 — full dir name appears verbatim, OR its squashed (separator-stripped)
-//         form appears in the squashed message. Direct, unambiguous reference.
-//    80 — every ≥4-char hyphen/underscore token from the dir name appears in
-//         the message (requires the dir name to have ≥2 meaningful tokens).
-//    60 — ≥75% of meaningful tokens match AND at least 2 tokens hit.
-//     0 — anything weaker. Deliberately no suffix-fragment or single-token
-//         "leaf" matches: those collapse onto every dir sharing a common word
-//         (e.g. "blueprint" matched 11 dirs and spawned 11 terminals).
-function scoreProject(message: string, proj: string): number {
-  const m = message.toLowerCase()
-  const p = proj.toLowerCase()
-  if (m.includes(p)) return 100
-
-  // Spoken un-hyphenated form ("paul the robot baby" → "paultherobotbaby").
-  // ≥6 chars so tiny names can't match inside unrelated words.
-  const mSquash = m.replace(/[^a-z0-9]+/g, '')
-  const pSquash = p.replace(/[^a-z0-9]+/g, '')
-  if (pSquash.length >= 6 && mSquash.includes(pSquash)) return 100
-
-  const mWords = m.split(/[^a-z0-9]+/).filter(w => w.length >= 3)
-  const tokens = p.split(/[-_]+/).filter(t => t.length >= 4)
-  if (tokens.length < 2 || mWords.length === 0) return 0
-
-  let hit = 0
-  for (const token of tokens) {
-    // Containment requires ≥5-char words: with ≥3 a stopword inside an
-    // un-hyphenated name matched everything ("the" ⊂ "paultherobotbaby").
-    if (mWords.some(w =>
-      w === token ||
-      (token.length >= 6 && (w.includes(token) || (w.length >= 5 && token.includes(w))))
-    )) hit++
-  }
-  if (hit === tokens.length) return 80
-  if (hit >= 2 && hit / tokens.length >= 0.75) return 60
-  return 0
-}
-
-// Heuristic target detection. Given the user's free-text message and the list
-// of available project directory names, decide which (if any) projects to
-// delegate to. Returns:
-//   []              → no confident match. The root agent handles the message
-//                     and asks for clarification if it sees an implicit dir
-//                     reference (per its [F] AMBIGUOUS rule).
-//   [single]        → one clear best match. Caller delegates to it.
-//   [a, b, …]       → only when MULTIPLE projects each hit the strongest tier
-//                     (verbatim/squashed full-name), i.e. the user explicitly
-//                     named more than one dir ("audit X and Y"). Caller fans
-//                     out one sub-agent per project.
-// Soft signal that the user is asking for work in MORE THAN ONE project even
-// if our deterministic matcher only locked onto one. Speech-to-text mishearing
-// of a second project name is the common failure mode — e.g. the user says
-// "audit X as well as Y" but STT garbles Y into something detectTargets can't
-// match; we'd then single-target dispatch on X only and the child would get a
-// "fix two things" prompt it can only half-honor.
-// Triggers: explicit multi-conjunctions, "both", or two+ mentions of repo-like
-// nouns. False positives just incur an extra root-agent turn (the root sees
-// the full message + dir list and decides how to dispatch).
-export function looksLikeMultiTarget(message: string): boolean {
-  const m = message.toLowerCase()
-  if (/\b(as well as|along with|together with|in addition to)\b/.test(m)) return true
-  if (/\bboth\b/.test(m)) return true
-  if (/\b(two|three|four|several|multiple)\b.*\b(repo|repository|project|directory|terminal)s?\b/.test(m)) return true
-  const repoMentions = (m.match(/\b(repo|repository|project|directory)\b/g) ?? []).length
-  if (repoMentions >= 2) return true
-  return false
-}
-
-// Weak-tier ties intentionally collapse to [] rather than fan out — a single
-// generic word like "blueprint" used to match 11 dirs and spawn 11 terminals.
-export function detectTargets(message: string, available: Array<string>): Array<string> {
-  const scored = available
-    .map(proj => ({ proj, score: scoreProject(message, proj) }))
-    .filter(x => x.score > 0)
-  if (scored.length === 0) return []
-
-  const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '')
-
-  // Strong tier: verbatim or squashed full-name match. When two such matches
-  // overlap as prefix/suffix, the user clearly said the longer one and the
-  // shorter just shares letters — drop it. ("rta-blueprint-react-ui-azure"
-  // wins over "rta-blueprint-react-ui" in the same spoken phrase.)
-  const strong = scored.filter(s => s.score >= 100)
-  const strongDeduped = strong.filter(({ proj }) => {
-    const me = squash(proj)
-    return !strong.some(({ proj: other }) =>
-      other !== proj && squash(other).length > me.length && squash(other).includes(me),
-    )
-  })
-  if (strongDeduped.length >= 1) return strongDeduped.map(x => x.proj)
-
-  // No strong match: take the single best weak match. Tied weak matches stay
-  // unrouted so the root agent can ask which dir the user meant.
-  const weak = scored.filter(s => s.score < 100).sort((a, b) => b.score - a.score)
-  const best = weak[0].score
-  const top = weak.filter(x => x.score === best)
-  return top.length === 1 ? [top[0].proj] : []
-}
+// NOTE: directory resolution is no longer done here. The root agent (Claude)
+// receives the raw user message plus the full project list (see PromptBuilder)
+// and decides which repo to open, calling open_terminal itself. An earlier
+// keyword/fuzzy matcher that guessed the target before the model saw the request
+// lived here and was removed — it routinely guessed wrong (parent vs nested
+// child, the assistant's own name, build-output dirs).
 
 export class AgentOrchestrator {
   private logger: AuditLogger
@@ -174,6 +91,18 @@ export class AgentOrchestrator {
   // distinguish "new since you last looked" from "stale, you've already seen
   // this" so the root agent isn't endlessly re-told about the same finish.
   private acknowledgedDoneAt = new Map<string, number>()
+  // Last terminal id opened per (session, target) — including idle terminals
+  // that never ran a task. Lets a repeat "open X" REUSE the existing tab/term
+  // instead of minting a new id every time (which stacked duplicate terminals).
+  // Keyed `${axelSessionId}:${targetName}`.
+  private openedTerminals = new Map<string, string>()
+  // Per-terminal Claude transcript locator: the cwd + session-id chain needed to
+  // read that terminal's COMPLETE persisted conversation from disk. Populated
+  // from each `pty_ready`, keyed `${axelSessionId}:${targetName}:${term}`. Unlike
+  // childTranscripts (per-run summary buffer) this is NOT reset per run and NOT
+  // cleared on PTY exit — the transcript file persists, so the root can always
+  // read the full history, mid-run or long after a terminal finished or died.
+  private terminalTranscripts = new Map<string, { cwd: string; sessionIds: Array<string>; lastAt: number }>()
 
   constructor(private opts: OrchestratorOpts) {
     if (opts.allowedDirs.length === 0) {
@@ -216,6 +145,22 @@ export class AgentOrchestrator {
     for (const key of [...this.inFlightByDir.keys()])     if (key.startsWith(prefix)) this.inFlightByDir.delete(key)
     for (const key of [...this.childTranscripts.keys()])  if (key.startsWith(prefix)) this.childTranscripts.delete(key)
     for (const key of [...this.acknowledgedDoneAt.keys()]) if (key.startsWith(prefix)) this.acknowledgedDoneAt.delete(key)
+    for (const key of [...this.openedTerminals.keys()])   if (key.startsWith(prefix)) this.openedTerminals.delete(key)
+    for (const key of [...this.terminalTranscripts.keys()]) if (key.startsWith(prefix)) this.terminalTranscripts.delete(key)
+  }
+
+  // Record where a terminal's persisted Claude transcript lives, from its
+  // pty_ready. Appends to the session-id chain (a --resume that forks writes a
+  // new file) so reads span the whole conversation across PTY restarts.
+  private recordTerminalTranscript(childKey: string, claudeSessionId: string, cwd: string): void {
+    const entry = this.terminalTranscripts.get(childKey)
+    if (!entry) {
+      this.terminalTranscripts.set(childKey, { cwd, sessionIds: [claudeSessionId], lastAt: Date.now() })
+      return
+    }
+    entry.cwd = cwd
+    entry.lastAt = Date.now()
+    if (!entry.sessionIds.includes(claudeSessionId)) entry.sessionIds.push(claudeSessionId)
   }
 
   // Snapshot of child terminals worth telling the root agent about on its
@@ -257,15 +202,32 @@ export class AgentOrchestrator {
     return out
   }
 
+  // Whether any child of this session has FINISHED with surface-worthy output
+  // the root hasn't acknowledged yet. Gates the auto-wake so the root is pinged
+  // only on real completion (non-empty transcript / report), never on the
+  // premature ready-cap target_done where the transcript is still empty —
+  // which had the root querying mid-work and going silent when work truly
+  // finished. Read-only: does NOT mark anything acknowledged (that stays with
+  // getChildStatusForRoot, which runs when the woken root actually looks).
+  hasFreshChildOutput(sessionId: string): boolean {
+    const prefix = `${sessionId}:`
+    for (const [key, buf] of this.childTranscripts) {
+      if (!key.startsWith(prefix)) continue
+      if (!buf.text.trim()) continue
+      if (buf.doneAt === null) continue
+      if (buf.doneAt !== (this.acknowledgedDoneAt.get(key) ?? 0)) return true
+    }
+    return false
+  }
+
   async handleMessage(
     userMessage: string,
     sessionId: string,
     onEvent: (event: FanOutEvent) => void,
     onAuthUrl: (url: string) => void,
-    // forceRoot: bypass detectTargets and run the root agent unconditionally.
-    // Used by server-initiated synthetic turns (e.g. the queue auto-wake) whose
-    // text may incidentally contain a project name and must NOT be re-routed
-    // to that project as a child terminal.
+    // forceRoot is retained for wire-compatibility (the server's auto-wake passes
+    // it) but is now a no-op: every message already runs the root agent, since
+    // directory routing was moved into the model itself.
     opts?: { projectsDir?: string; uiLocation?: string; forceRoot?: boolean },
   ): Promise<void> {
     if (Buffer.byteLength(userMessage, 'utf-8') > MAX_USER_MESSAGE_BYTES) {
@@ -276,50 +238,15 @@ export class AgentOrchestrator {
     const effectiveAllowedDirs = opts?.projectsDir ? [opts.projectsDir] : this.opts.allowedDirs
     const rootForTargets       = opts?.projectsDir ?? this.opts.projectsDir
 
-    // Detect which project directories the user is referring to. Skipped when
-    // the caller has explicitly demanded the root path (forceRoot).
-    const availableProjects = opts?.forceRoot ? [] : await listProjects(rootForTargets)
-    const targets           = opts?.forceRoot ? [] : detectTargets(userMessage, availableProjects)
-
-    if (targets.length >= 2) {
-      // Multi-target: spawn independent sub-agents in parallel, one per project.
-      console.log(`[orchestrator] parallel fan-out → ${targets.length} targets:`, targets.join(', '))
-      this.runFanOut(userMessage, sessionId, targets, rootForTargets, onEvent, onAuthUrl)
-      return
-    }
-
-    if (targets.length === 1 && !opts?.forceRoot && !looksLikeMultiTarget(userMessage)) {
-      // Single identified target: route straight to a sub-agent in that directory.
-      // The root orchestrator never edits files itself — it delegates.
-      // Guard: if the message wording implies MORE THAN ONE target (e.g. "X as
-      // well as Y") and we only matched one, fall through to the root agent
-      // path so it can parse the full message and call open_terminal per dir.
-      // Speech-to-text errors on the second dir name are the common cause.
-      const [targetName] = targets
-      const targetDir = path.join(rootForTargets, targetName)
-      console.log(`[orchestrator] single-target sub-agent → ${targetName} (detached)`)
-      // Untagged token → spoken by the main session's TTS and shown in the
-      // main chat, so the user hears the hand-off instead of silence.
-      onEvent({ type: 'token', value: `Opening a terminal in ${targetName} — it'll work in the background and I'll let you know when it's done.` })
-      onEvent({ type: 'message_end' })
-      // Emit terminal_open so the client materializes the tab immediately —
-      // matches the explicit open_terminal and fan-out paths. Without this the
-      // tab was invisible until the child finally emitted a token at end-of-
-      // turn (PTY children don't emit tokens during the turn) and the user
-      // saw a "tabless ring" for the entire run. term='main' matches what
-      // handleDirMessage tags its events with so the key collapses.
-      onEvent({ type: 'terminal_open', target: targetName, term: 'main' })
-      onEvent({ type: 'target_start', target: targetName })
-      // Deliberately NOT awaited: the root turn ends as soon as the hand-off is
-      // announced, freeing the user to issue the next task. The child keeps
-      // streaming target-tagged events until its target_done arrives.
-      void this.handleDirMessage(userMessage, sessionId, targetName, targetDir, onEvent, onAuthUrl)
-        .finally(() => onEvent({ type: 'target_done', target: targetName }))
-        .catch(err => console.error('[orchestrator] sub-agent error:', err))
-      return
-    }
-
-    // No specific project detected — run the main agent (general Q&A, planning, etc.).
+    // No deterministic pre-routing. Every user message goes to the root agent
+    // (Claude), which decides what the user wants: it has the full project list
+    // (including nested repos) in its system prompt plus filesystem search tools,
+    // so it finds the repo the user named — however fuzzily — and opens it itself
+    // by calling open_terminal with the resolved path. open_terminal materializes
+    // the ring in the UI, so the open is reflected on screen. Letting the model
+    // do the finding-and-opening replaced an earlier keyword matcher that guessed
+    // the directory before Claude ever saw the request and routinely guessed
+    // wrong (parent instead of nested child, the assistant's own name, etc.).
     const claudeSessionId    = this.sessions.get(sessionId)
     // Background-terminal status feeds into the system prompt so the root
     // agent always knows what its sub-agents have said — no client-side
@@ -327,6 +254,7 @@ export class AgentOrchestrator {
     const childStatus        = this.getChildStatusForRoot(sessionId)
     const systemPrompt       = await this.promptBuilder.build(effectiveAllowedDirs, {
       root: true,
+      compact: this.opts.isCompactModel?.() ?? false,
       uiLocation: opts?.uiLocation,
       childStatus,
     })
@@ -396,7 +324,9 @@ export class AgentOrchestrator {
     const dirKey = `${sessionId}:${targetName}`
     const prevClaudeId = this.targetSessions.get(childKey)
     const childAllowed = [targetDir]
-    const childPrompt = await this.promptBuilder.build(childAllowed)
+    const childPrompt = await this.promptBuilder.build(childAllowed, {
+      compact: this.opts.isCompactModel?.() ?? false,
+    })
     this.inFlightByDir.set(dirKey, (this.inFlightByDir.get(dirKey) ?? 0) + 1)
     // Fresh run: reset the buffer so the root agent's "BACKGROUND TERMINALS"
     // section reflects THIS run, not the previous one's stale output. Also
@@ -407,6 +337,18 @@ export class AgentOrchestrator {
     // the server-side buffer for later root agent consumption, and (b) tag
     // every event with the child's target/term as before.
     const wrappedOnEvent = (ev: AgentEvent): void => {
+      if (ev.type === 'pty_ready') {
+        // Make this terminal addressable + reusable the MOMENT its PTY exists —
+        // not only when its turn ends. Without this, a terminal still mid-work
+        // (or one whose turn-end detection missed) can't be found for a
+        // follow-up, so the agent wrongly spawns a new tab. targetSessions maps
+        // the live PTY spawnId (used to resume the same conversation);
+        // openedTerminals marks it as the target's current terminal so a bare
+        // follow-up reuses it. Covers the user's own `main` terminal too.
+        this.targetSessions.set(childKey, ev.spawnId)
+        this.openedTerminals.set(dirKey, term)
+        if (ev.claudeSessionId && ev.cwd) this.recordTerminalTranscript(childKey, ev.claudeSessionId, ev.cwd)
+      }
       if (ev.type === 'token' && typeof ev.value === 'string') {
         const buf = this.childTranscripts.get(childKey)
         if (buf) {
@@ -434,8 +376,8 @@ export class AgentOrchestrator {
         targetDir,
         childAllowed,
         // A child may open extra terminals in its OWN dir only (parallel work
-        // within one project) — detectTargets routes "open two terminals in X"
-        // straight to X's child, so the capability must exist here too.
+        // within one project), so the open_terminal capability must exist here
+        // too — restricted to its own dir.
         this.makeTerminalHandler({ sessionId, root: path.dirname(targetDir), restrictTo: { targetName, targetDir }, onEvent, onAuthUrl }),
         // Child agents may only open files inside their own project dir; the
         // root run can open any file under allowedDirs. Per-target tagging on
@@ -463,9 +405,10 @@ export class AgentOrchestrator {
     }
   }
 
-  // Builds the per-spawn open_terminal handler. Root runs may open a terminal
-  // in any TOP-LEVEL project under `root` (nested dirs would dead-end: the UI
-  // only auto-opens root children). Child runs are restricted to their own dir.
+  // Builds the per-spawn open_terminal handler. Root runs may open a terminal in
+  // any real directory under `root`, including NESTED project paths like
+  // "clients/acme-web-app" — the UI renders nested rings. Child runs are
+  // restricted to their own dir.
   private makeTerminalHandler(ctx: {
     sessionId: string
     root: string
@@ -491,33 +434,61 @@ export class AgentOrchestrator {
         if (!isPathUnder(resolved, [rootAbs])) {
           return { ok: false, error: 'Directory is outside the projects root.' }
         }
-        const rel = path.relative(rootAbs, resolved)
-        if (!rel || rel.includes(path.sep)) {
-          return { ok: false, error: 'Only top-level project directories can host terminals.' }
+        const rel = path.relative(rootAbs, resolved).split(path.sep).join('/')
+        if (!rel) {
+          return { ok: false, error: 'Cannot host a terminal on the projects root itself — name a project directory.' }
         }
-        const available = await listProjects(rootAbs)
-        if (!available.includes(rel)) {
-          return { ok: false, error: `No project named "${rel}" — available: ${available.join(', ')}` }
+        // Nested projects are allowed: repos are grouped in folders (e.g.
+        // clients/acme-web-app), so `directory` may be a multi-segment
+        // path. The model named it explicitly, so just require it to be a real
+        // directory under the root — no second-guessing whether we'd have
+        // surfaced it via fuzzy discovery.
+        const isDir = await stat(resolved).then(s => s.isDirectory()).catch(() => false)
+        if (!isDir) {
+          return { ok: false, error: `No directory "${rel}" under the projects root.` }
         }
         targetName = rel
         targetDir  = resolved
       }
 
-      // Reuse path: when the caller passes `term` AND a runtime session for
-      // (sessionId, target, term) already exists, send the new prompt to that
-      // PTY instead of spawning a fresh one. This is the model's way to do
-      // follow-up work in an already-open terminal — same conversation, same
-      // visible tab — instead of stacking up a new tab per request.
+      // Term selection. REUSE IS THE DEFAULT: a prompt continues the target's
+      // existing terminal (same conversation) unless the caller explicitly asks
+      // for a fresh one. This is the whole point of the tool — you talk TO your
+      // terminals, you don't stack a new tab per message.
+      //   1. explicit `term` → that specific terminal (main, or a t-xxxx id).
+      //   2. `new: true` → force a brand-new parallel terminal (user asked to
+      //      work on something separate alongside the existing one).
+      //   3. otherwise, if a terminal already exists for this target → REUSE it
+      //      (feed the follow-up in), whether or not there's a prompt.
+      //   4. no terminal exists yet → open the first one.
       const reqTerm = typeof args.term === 'string' ? args.term.trim() : ''
-      const existingKey = reqTerm ? `${ctx.sessionId}:${targetName}:${reqTerm}` : ''
-      const reused = !!(reqTerm && this.targetSessions.has(existingKey))
-      const term = reused ? reqTerm : `t-${randomUUID().slice(0, 8)}`
-      // terminal_open is idempotent on the client (it ignores already-present
-      // keys), but for a clean reuse we skip it — the tab is already on screen
-      // and emitting it again would only burn a wire round-trip.
-      if (!reused) ctx.onEvent({ type: 'terminal_open', target: targetName, term })
-
+      const wantNew = args.new === true
+      const openKey = `${ctx.sessionId}:${targetName}`
+      const existingForTarget = this.openedTerminals.get(openKey)
       const prompt = args.prompt?.trim()
+      const isKnownTerm = (t: string): boolean =>
+        existingForTarget === t ||
+        this.targetSessions.has(`${ctx.sessionId}:${targetName}:${t}`) ||
+        this.terminalTranscripts.has(`${ctx.sessionId}:${targetName}:${t}`)
+      let term: string
+      let reused: boolean
+      if (reqTerm) {
+        term = reqTerm
+        reused = isKnownTerm(reqTerm)
+      } else if (existingForTarget && !wantNew) {
+        term = existingForTarget
+        reused = true
+      } else {
+        term = `t-${randomUUID().slice(0, 8)}`
+        reused = false
+      }
+      this.openedTerminals.set(openKey, term)
+      // terminal_open is idempotent on the client (dedup by key) AND re-triggers
+      // the orb to refocus on this target — so emit it every time, including
+      // reuse, where it's how a repeat "open X" pulls the orb back without
+      // spawning a second tab.
+      ctx.onEvent({ type: 'terminal_open', target: targetName, term })
+
       if (prompt) {
         // Detached, like delegation: the tool returns immediately while the
         // terminal streams term-tagged events until its target_done.
@@ -531,47 +502,98 @@ export class AgentOrchestrator {
     }
   }
 
+  // All terminal terms known for a (session, target), most-recently-active
+  // first. Draws from the transcript locators (readable full history) and any
+  // live runtime sessions (just-opened terminals with no transcript yet), so
+  // enumeration reaches EVERY terminal — the agent-spawned t-xxxx ones and the
+  // user's own "main" tab alike.
+  private listTerms(sessionId: string, target: string): Array<string> {
+    const prefix = `${sessionId}:${target}:`
+    const seen = new Map<string, number>()
+    for (const [key, entry] of this.terminalTranscripts) {
+      if (key.startsWith(prefix)) seen.set(key.slice(prefix.length), entry.lastAt)
+    }
+    for (const key of this.targetSessions.keys()) {
+      if (key.startsWith(prefix) && !seen.has(key.slice(prefix.length))) seen.set(key.slice(prefix.length), 0)
+    }
+    return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([t]) => t)
+  }
+
+  // Resolve one terminal's readable content, best source first. Returns null
+  // when the terminal has nothing yet. Peeking the live PTY yields both its raw
+  // tail AND its claude session id — the session id lets us read the FULL
+  // transcript even for a terminal we have no recorded locator for: one the user
+  // drove by hand (dir_input / typing straight into the xterm) or whose
+  // pty_ready we never saw. Recording it keeps it readable after the PTY dies.
+  private readTerminalContent(
+    sessionId: string, target: string, term: string, raw: boolean,
+  ): { text: string; source: 'full' | 'transcript' | 'raw' | 'mixed' } | null {
+    const childKey = `${sessionId}:${target}:${term}`
+    let rawText: string | null = null
+    const spawnId = this.targetSessions.get(childKey)
+    if (spawnId) {
+      const peek = this.getAgent().peek?.(spawnId)
+      if (peek) {
+        rawText = peek.strippedTail.trim() || peek.turnText.trim() || null
+        if (peek.claudeSessionId && peek.cwd) this.recordTerminalTranscript(childKey, peek.claudeSessionId, peek.cwd)
+      }
+    }
+    // The complete persisted conversation — the authoritative source. Works
+    // mid-run too: claude appends each user/assistant/tool message to the
+    // transcript as it happens, so a "working" terminal is fully readable.
+    const locator = this.terminalTranscripts.get(childKey)
+    const full = locator
+      ? readClaudeTranscript({ cwd: locator.cwd, sessionIds: locator.sessionIds, maxChars: TERMINAL_READ_MAX_CHARS }).trim()
+      : ''
+    const summary = (this.childTranscripts.get(childKey)?.text ?? '').trim()
+
+    if (raw) {
+      if (rawText) return { text: rawText, source: 'raw' }
+      if (full) return { text: full, source: 'full' }
+      if (summary) return { text: summary, source: 'transcript' }
+      return null
+    }
+    if (full) return { text: full, source: 'full' }
+    if (summary) {
+      if (rawText && rawText.length > summary.length * 1.5) {
+        return { text: `${summary}\n\n--- raw terminal tail (less filtered) ---\n${rawText}`, source: 'mixed' }
+      }
+      return { text: summary, source: 'transcript' }
+    }
+    if (rawText) return { text: rawText, source: 'raw' }
+    return null
+  }
+
   // Builds the per-spawn read_terminal handler. Resolves a (target, term?) into
-  // the child's recent text — either the orchestrator's cleaned childTranscripts
-  // buffer (default; populated by mcp__axel_report__report or end-of-turn
-  // scrape) or the live PTY's 4KB ANSI-stripped tail (`raw: true`; only
-  // applicable when the runtime is PtyAgent). Root spawns only — children
-  // mustn't peek at sibling terminals.
+  // that terminal's COMPLETE conversation, read from Claude Code's persisted
+  // JSONL transcript (authoritative, clean, survives PTY death). Falls back to
+  // the cleaned childTranscripts summary, then the live PTY's raw ANSI-stripped
+  // tail (`raw: true` prefers that live tail). Omitting `term` reads whichever
+  // of the target's terminals actually has content (most-recent first) and lists
+  // the rest. Root spawns only — children mustn't peek at sibling terminals.
   private makeTerminalReadHandler(ctx: { sessionId: string }): TerminalReadHandler {
     return async args => {
       const target = (args.target ?? '').trim()
       if (!target) return { ok: false, error: '`target` is required: the dir name of the terminal to read.' }
-      const term = (args.term ?? '').trim() || 'main'
-      const childKey = `${ctx.sessionId}:${target}:${term}`
 
-      let rawText: string | null = null
-      const spawnId = this.targetSessions.get(childKey)
-      if (spawnId) {
-        const peek = this.getAgent().peek?.(spawnId)
-        if (peek) rawText = peek.strippedTail.trim() || peek.turnText.trim() || null
+      const reqTerm = (args.term ?? '').trim()
+      const known = this.listTerms(ctx.sessionId, target)
+      // When a specific term is asked for, honour it. Otherwise try the known
+      // terminals most-recent first and return the first with real content —
+      // so "read the terminal" surfaces the meaningful one even when a newer but
+      // empty terminal was opened after it (the exact original failure).
+      const candidates = reqTerm ? [reqTerm] : (known.length ? known : ['main'])
+      const enumerating = !reqTerm && known.length > 1
+
+      for (const term of candidates) {
+        const content = this.readTerminalContent(ctx.sessionId, target, term, !!args.raw)
+        if (!content) continue
+        const header = enumerating
+          ? `[${known.length} terminals open for ${target}: ${known.join(', ')} — showing ${term}. Pass \`term\` to read a specific one.]\n\n`
+          : ''
+        return { ok: true, target, term, text: header + content.text, source: content.source }
       }
-
-      const transcript = (this.childTranscripts.get(childKey)?.text ?? '').trim()
-
-      if (args.raw) {
-        if (rawText) return { ok: true, target, term, text: rawText, source: 'raw' }
-        if (transcript) return { ok: true, target, term, text: transcript, source: 'transcript' }
-        return { ok: false, error: `No text yet for ${target} [${term}] — terminal may be idle or just opened.` }
-      }
-
-      // Default: prefer the cleaned transcript (it's structured prose from
-      // report() or a noise-filtered scrape). If empty, fall back to raw —
-      // better to hand the model messy bytes than say "no output".
-      if (transcript) {
-        // If we ALSO have raw and they diverge meaningfully, include both —
-        // sometimes the cleaner stripped findings the raw kept.
-        if (rawText && rawText.length > transcript.length * 1.5) {
-          return { ok: true, target, term, text: `${transcript}\n\n--- raw terminal tail (less filtered) ---\n${rawText}`, source: 'mixed' }
-        }
-        return { ok: true, target, term, text: transcript, source: 'transcript' }
-      }
-      if (rawText) return { ok: true, target, term, text: rawText, source: 'raw' }
-      return { ok: false, error: `No text yet for ${target} [${term}] — terminal may be idle or just opened.` }
+      return { ok: false, error: `No text yet for ${target} [${candidates[0]}] — terminal may be idle or just opened.` }
     }
   }
 
@@ -615,7 +637,12 @@ export class AgentOrchestrator {
     sessionId: string
     onEvent: (event: FanOutEvent) => void
   }): CleanupHandler {
-    return async () => {
+    return async args => {
+      // go_home: not a cleanup — just return the orb to the projects root.
+      if (args?.action === 'go_home') {
+        ctx.onEvent({ type: 'ui_focus_root' })
+        return { ok: true, closed: [] }
+      }
       const prefix = `${ctx.sessionId}:`
       const byDir = new Map<string, Array<string>>()  // targetName → child-keys for this session
       for (const key of this.targetSessions.keys()) {
@@ -645,51 +672,4 @@ export class AgentOrchestrator {
     }
   }
 
-  private runFanOut(
-    userMessage: string,
-    sessionId: string,
-    targetNames: Array<string>,
-    root: string,
-    onEvent: (event: FanOutEvent) => void,
-    onAuthUrl: (url: string) => void,
-  ): void {
-    const targets = targetNames.map((name, order) => ({
-      id: name, name, dir: path.join(root, name), order,
-    }))
-
-    // Spoken hand-off so the user hears the fan-out instead of silence.
-    onEvent({ type: 'token', value: `Spinning up ${targets.length} terminals — I'll let you know as each one finishes.` })
-    onEvent({ type: 'message_end' })
-
-    // Announce the plan so the UI can set up star systems.
-    onEvent({ type: 'task_plan', tasks: targets })
-    onEvent({ type: 'fan_out', targets })
-
-    // Stagger target_start events so the UI orb travels to each star system
-    // one by one (animation), but ALL sub-agents launch simultaneously —
-    // "go to first place, open session, move on to next place".
-    const ORB_TRAVEL_MS = 750
-    targets.forEach((t, i) => {
-      setTimeout(() => onEvent({ type: 'target_start', target: t.id }), i * ORB_TRAVEL_MS)
-    })
-
-    // Detached, like the single-target path: every sub-agent runs in its own
-    // directory with its own Claude session; the root turn ends immediately.
-    // Failures in one don't stop the others.
-    void Promise.allSettled(
-      targets.map(async t => {
-        try {
-          await this.handleDirMessage(userMessage, sessionId, t.id, t.dir, onEvent, onAuthUrl)
-        } finally {
-          onEvent({ type: 'target_done', target: t.id })
-        }
-      }),
-    ).then(results => {
-      for (const r of results) {
-        if (r.status === 'rejected') {
-          console.error('[orchestrator] sub-agent error:', r.reason)
-        }
-      }
-    })
-  }
 }

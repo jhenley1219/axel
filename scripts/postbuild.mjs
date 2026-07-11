@@ -25,7 +25,7 @@ console.log('postbuild: copied web dist → apps/server/public')
 // we skip those to avoid a "src and dest are the same" error.
 import { realpathSync } from 'fs'
 
-for (const pkg of ['core', 'agent', 'auth', 'stt']) {
+for (const pkg of ['core', 'agent', 'auth', 'stt', 'observability']) {
   const src = join(root, 'packages', pkg)
   const dest = join(root, 'apps', 'server', 'node_modules', '@axel', pkg)
 

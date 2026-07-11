@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { config } from '../config.js'
-import { sessionManager, orchestrator } from '../services.js'
+import { sessionManager, orchestrator, observability } from '../services.js'
 import { sessionGuard } from '../middleware/sessionGuard.js'
 
 export const sessionRouter = Router()
@@ -20,6 +20,7 @@ sessionRouter.post('/api/session/reset', sessionGuard, (req, res) => {
     }
     sessionId = session.sessionId
   }
+  observability.sessionReset(sessionId)
   orchestrator.resetSession(sessionId)
   res.json({ ok: true })
 })

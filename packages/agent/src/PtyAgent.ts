@@ -13,8 +13,10 @@
 //   • Voice TTS is SILENT in PTY mode — see extractAssistantText below for
 //     why. The xterm view shows everything live; spoken response is future
 //     work that needs structured text from a sidechannel.
-//   • No --resume across PTY restarts: closing a PTY loses its conversation
-//     (claude session id isn't surfaced over the TUI in a parseable form).
+//   • Conversation continuity IS preserved across PTY restarts: we control the
+//     claude session id at spawn (--session-id on first open, --resume on
+//     reopen of a closed terminal), so a reopened terminal continues the same
+//     conversation and its full transcript stays readable at a known path.
 import { spawn as ptySpawn } from 'node-pty'
 import type { IPty } from 'node-pty'
 import { randomUUID } from 'crypto'
@@ -73,6 +75,24 @@ const READY_SILENCE_MS = Number(process.env.PTY_READY_SILENCE_MS ?? 500)
 // ceiling lets follow-up turns dispatch even when ready-detection fails —
 // the user sees the live response in xterm regardless.
 const READY_MAX_WAIT_MS = Number(process.env.PTY_READY_MAX_WAIT_MS ?? 45_000)
+// Completion for a CHILD PTY is the child's report call (authoritative — the
+// same "done" signal the root agent reads). The ONLY heuristic fallback is the
+// child sitting idle AT ITS INPUT PROMPT with no output for this long: long
+// enough that a redraw lull can't trip it, and gated on the prompt box so a
+// quiet tool call (stalled spinner, slow MCP roundtrip) is NOT mistaken for
+// done. There is deliberately NO hard time cap on a child turn — a task that
+// legitimately runs long holds only its own terminal's queue; other terminals
+// and the root run on independent queues. This is what stops a terminal from
+// reading "done" while the child inside is still working.
+const CHILD_IDLE_MS = Number(process.env.PTY_CHILD_IDLE_MS ?? 2000)
+// Turn-end fallback keyed on TOTAL output silence, independent of the prompt-box
+// regex. A working claude animates its spinner ~10 Hz, so the PTY is NEVER
+// silent for seconds while it's actually thinking or running a tool — several
+// seconds of complete stillness means it's genuinely idle (done, or waiting for
+// input). This recovers turn completion when isAtPrompt misses a TUI redesign,
+// which otherwise leaves the terminal stuck "working" forever and unreachable
+// for follow-ups. Longer than CHILD_IDLE_MS so a brief settle can't trip it.
+const CHILD_SILENCE_MS = Number(process.env.PTY_CHILD_SILENCE_MS ?? 6000)
 const MAX_BACKLOG_BYTES = 64 * 1024
 const MAX_STRIPPED_TAIL = 4 * 1024
 const DEBUG_PTY = process.env.PTY_DEBUG === '1'
@@ -167,6 +187,10 @@ type PtySessionState = {
   pty: IPty
   axelSessionId: string
   cwd: string
+  // The claude session id this PTY runs under (we set it via --session-id, or
+  // carry it forward via --resume when reopening a closed terminal). Names the
+  // persisted transcript file the root agent reads: <slug(cwd)>/<id>.jsonl.
+  claudeSessionId: string
   cleanupFns: Array<() => void>
   backlog: Array<Buffer>
   backlogBytes: number
@@ -206,6 +230,9 @@ type OpenSessionArgs = {
   queueRole?: QueueSpawnRole
   runSettings: RunSettings
   apiKey?: string
+  // When set, reopen the same claude conversation via --resume instead of
+  // minting a new --session-id. Used when a closed terminal is reopened.
+  resumeClaudeId?: string
 }
 
 export class PtyAgent implements AgentRuntime {
@@ -252,7 +279,14 @@ export class PtyAgent implements AgentRuntime {
     })
 
     let session = runtimeSessionId ? this.sessions.get(runtimeSessionId) : undefined
-    if (session && session.isClosed) session = undefined
+    // Reopening a closed terminal: carry its claude session id forward so the
+    // fresh PTY --resumes the same conversation (one continuous thread the root
+    // can read end-to-end) instead of starting a disconnected new one.
+    let resumeClaudeId: string | undefined
+    if (session && session.isClosed) {
+      resumeClaudeId = session.claudeSessionId
+      session = undefined
+    }
 
     if (!session) {
       const runSettings = (await this.spawnOpts?.getRunSettings?.()) ?? {}
@@ -270,6 +304,7 @@ export class PtyAgent implements AgentRuntime {
           queueRole,
           runSettings,
           apiKey,
+          resumeClaudeId,
         })
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'pty_spawn_failed'
@@ -279,7 +314,7 @@ export class PtyAgent implements AgentRuntime {
         onAuthUrl(msg)
         throw err
       }
-      onEvent({ type: 'pty_ready', spawnId: session.spawnId })
+      onEvent({ type: 'pty_ready', spawnId: session.spawnId, claudeSessionId: session.claudeSessionId, cwd: session.cwd })
     }
 
     // Settle on a ready prompt before typing.
@@ -290,13 +325,26 @@ export class PtyAgent implements AgentRuntime {
     // accumulating this turn's output (and only this turn's) — used below to
     // synthesize the transcript token event.
     session.turnText = ''
+    // New turn: forget the previous turn's report so completion waits for THIS
+    // turn's signal. The report flag is otherwise sticky for the PTY's whole
+    // lifetime, which would make turn 2+ "complete" instantly.
+    if (session.reportSpawnId) this.spawnOpts?.reportBroker?.clearReported(session.reportSpawnId)
     session.pty.write(userMessage)
     // 30 ms tick so the input box renders the text before we submit — long
     // pastes truncated on the very next \r without this.
     await new Promise(r => setTimeout(r, 30))
     session.pty.write('\r')
 
-    await this.waitForReady(session)
+    // A child PTY turn is done when the child REPORTS done to the master, not
+    // when its TUI merely looks idle — a long task or a quiet tool stretch must
+    // not flip the terminal to "done" prematurely (the "said done while still
+    // running" bug). Root PTYs have no report channel, so they keep the
+    // heuristic ready wait.
+    if (session.reportSpawnId) {
+      await this.waitForChildTurnEnd(session, session.reportSpawnId)
+    } else {
+      await this.waitForReady(session)
+    }
     session.inFlight = false
 
     // Scrape the cleaned per-turn output as a fallback transcript, but ONLY
@@ -306,7 +354,17 @@ export class PtyAgent implements AgentRuntime {
     // window would prefer the noise — exactly the "garbled fragments" bug.
     const broker = this.spawnOpts?.reportBroker
     const reported = !!(session.reportSpawnId && broker?.wasReported(session.reportSpawnId))
-    if (!reported) {
+    // Only scrape the TUI tail when the child has actually gone QUIET. If
+    // waitForReady resolved via its hard cap while output is still streaming
+    // (a long task that outran the cap), scraping mid-stream pushes garbled
+    // fragments into the transcript AND makes the orchestrator fire target_done
+    // mid-work — the "pinged before it's finished, then nothing when it is"
+    // bug. Skipping the scrape here keeps the transcript empty until the child
+    // either truly idles or calls report(), so the wake only fires on real
+    // completion. Silence (not the prompt-box glyphs) is the completion signal,
+    // so this also recovers when the prompt-box regex misses the TUI version.
+    const trulyIdle = Date.now() - session.lastOutputAt > READY_SILENCE_MS
+    if (!reported && trulyIdle) {
       const tail = cleanTuiTail(session.turnText)
       if (tail) {
         onEvent({ type: 'token', value: tail })
@@ -325,10 +383,10 @@ export class PtyAgent implements AgentRuntime {
   // tail and per-turn buffer for the orchestrator's read_terminal tool. PTY
   // children render through xterm bytes so this is the ONLY place clean text
   // for them lives. Returns null when the spawn isn't known or has exited.
-  peek(spawnId: string): { strippedTail: string; turnText: string } | null {
+  peek(spawnId: string): { strippedTail: string; turnText: string; claudeSessionId?: string; cwd?: string } | null {
     const s = this.sessions.get(spawnId)
     if (!s || s.isClosed) return null
-    return { strippedTail: s.strippedTail, turnText: s.turnText }
+    return { strippedTail: s.strippedTail, turnText: s.turnText, claudeSessionId: s.claudeSessionId, cwd: s.cwd }
   }
 
   // Tear down every PTY for an auth session — called from the orchestrator's
@@ -356,6 +414,10 @@ export class PtyAgent implements AgentRuntime {
 
   private async openSession(args: OpenSessionArgs): Promise<PtySessionState> {
     const spawnId = randomUUID()
+    // The claude session id owns the persisted transcript. On a fresh terminal
+    // we mint one and pass --session-id; on reopen we reuse the prior id and
+    // pass --resume so claude continues the same conversation.
+    const claudeSessionId = args.resumeClaudeId ?? randomUUID()
     const mode: PermissionMode = args.runSettings.permissionMode ?? 'default'
 
     // Mirror ClaudeCodeAgent's per-spawn MCP bridge wiring — each broker
@@ -459,6 +521,9 @@ export class PtyAgent implements AgentRuntime {
       claudeArgs.push('--permission-mode', mode)
       if (permissionSpawnId) claudeArgs.push('--permission-prompt-tool', 'mcp__axel_permissions__approve')
     }
+    // Own the session id so the transcript path is deterministic and readable.
+    if (args.resumeClaudeId) claudeArgs.push('--resume', claudeSessionId)
+    else claudeArgs.push('--session-id', claudeSessionId)
     if (args.runSettings.model)  claudeArgs.push('--model', args.runSettings.model)
     if (args.runSettings.effort) claudeArgs.push('--effort', args.runSettings.effort)
     if (args.systemPrompt) claudeArgs.push('--system-prompt', args.systemPrompt)
@@ -497,6 +562,7 @@ export class PtyAgent implements AgentRuntime {
       pty,
       axelSessionId: args.axelSessionId,
       cwd: args.cwd,
+      claudeSessionId,
       cleanupFns: [
         () => mcp.cleanup(),
         () => { if (permissionSpawnId && broker) broker.unregister(permissionSpawnId) },
@@ -577,7 +643,17 @@ export class PtyAgent implements AgentRuntime {
     if (this.readyTimers.has(session.spawnId)) return
     let lastHash = ''
     let stableTicks = 0
+    // Second tracker on the RAW tail (spinner NOT masked) for a silence-based
+    // idle fallback. While claude works it animates a spinner, so the raw tail
+    // keeps changing; only when it goes COMPLETELY still is it genuinely idle.
+    let lastRaw = ''
+    let rawStableTicks = 0
     const POLL_MS = Math.max(200, Math.floor(READY_SILENCE_MS / 2))
+    // ~3s of total stillness ⇒ idle. Recovers completion detection when
+    // isAtPrompt's prompt-box regex misses a claude TUI version — without it,
+    // EVERY child turn rode the hard cap (~45s), so the root was pinged ~90s
+    // after a child that actually finished in seconds.
+    const IDLE_TICKS = Math.max(8, Math.ceil(3000 / POLL_MS))
     const tick = (): void => {
       if (session.isClosed || session.pendingReady.length === 0) {
         const t = this.readyTimers.get(session.spawnId)
@@ -587,7 +663,11 @@ export class PtyAgent implements AgentRuntime {
       const hash = session.strippedTail.replace(SPINNER_GLYPHS, '·').slice(-1024)
       if (hash === lastHash) stableTicks++
       else { stableTicks = 0; lastHash = hash }
-      if (stableTicks >= 2 && isAtPrompt(session.strippedTail)) {
+      const raw = session.strippedTail.slice(-1024)
+      if (raw === lastRaw) rawStableTicks++
+      else { rawStableTicks = 0; lastRaw = raw }
+      const promptIdle = stableTicks >= 2 && isAtPrompt(session.strippedTail)
+      if (promptIdle || rawStableTicks >= IDLE_TICKS) {
         if (DEBUG_PTY) {
           // eslint-disable-next-line no-console
           console.log('[pty] ready detected', {
@@ -641,6 +721,50 @@ export class PtyAgent implements AgentRuntime {
         wrapped()
       }, READY_MAX_WAIT_MS)
       cap.unref?.()
+    })
+  }
+
+  // Completion wait for a CHILD PTY turn. Resolves on the child's report call
+  // (authoritative — the same "done" the root agent consumes), on PTY exit, on
+  // idle-at-prompt, or on sustained TOTAL output silence (CHILD_SILENCE_MS).
+  // The silence fallback is safe because a working claude animates its spinner
+  // continuously, so real work never goes output-silent for seconds — only a
+  // genuinely idle terminal does. It exists so a finished child whose prompt box
+  // the regex doesn't recognize still ends its turn instead of hanging in
+  // "working" forever (which made the terminal unreachable for follow-ups).
+  private waitForChildTurnEnd(session: PtySessionState, reportSpawnId: string): Promise<void> {
+    if (session.isClosed) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      let settled = false
+      let poll: ReturnType<typeof setInterval> | null = null
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        if (poll) { clearInterval(poll); poll = null }
+        resolve()
+      }
+      // Primary: the child's report call.
+      this.spawnOpts?.reportBroker?.whenReported(reportSpawnId).then(finish, finish)
+      // Fallback: child idle at its input prompt (turn ended without a report).
+      const POLL_MS = Math.max(200, Math.floor(CHILD_IDLE_MS / 3))
+      poll = setInterval(() => {
+        if (session.isClosed) { finish(); return }
+        const silentFor = Date.now() - session.lastOutputAt
+        const idleAtPrompt = silentFor > CHILD_IDLE_MS && isAtPrompt(session.strippedTail)
+        const fullySilent  = silentFor > CHILD_SILENCE_MS
+        if (idleAtPrompt || fullySilent) {
+          if (DEBUG_PTY) {
+            // eslint-disable-next-line no-console
+            console.log('[pty] child turn end', {
+              spawnId: session.spawnId.slice(0, 8),
+              via: idleAtPrompt ? 'idle-at-prompt' : 'output-silence',
+              silentForMs: silentFor,
+            })
+          }
+          finish()
+        }
+      }, POLL_MS)
+      poll.unref?.()
     })
   }
 

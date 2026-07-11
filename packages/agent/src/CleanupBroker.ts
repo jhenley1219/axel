@@ -4,7 +4,10 @@
 // spawnId per spawn, handler registered alongside. The handler decides which
 // dirs are idle and emits dir_closed wire events.
 
-export type CloseIdleArgs = Record<string, never>
+// `action` selects between closing idle dirs (default) and returning the orb to
+// the projects root. Both ride the same per-spawn channel so go_home reuses the
+// cleanup broker/route without threading a new handler through every runtime.
+export type CloseIdleArgs = { action?: 'close_idle' | 'go_home' }
 export type CloseIdleResult =
   | { ok: true; closed: Array<string> }
   | { ok: false; error: string }

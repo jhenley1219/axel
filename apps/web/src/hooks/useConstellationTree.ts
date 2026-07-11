@@ -54,17 +54,17 @@ function scoreDir(dirName: string, text: string): number {
 
   // Squashed match: spoken un-hyphenated names arrive as separate words
   // ("paul the robot baby" → "paultherobotbaby"). ≥6 chars so tiny names
-  // can't match inside unrelated words. Mirrors server-side detectTargets.
+  // can't match inside unrelated words.
   const dSquash = dl.replace(/[^a-z0-9]+/g, '')
   if (dSquash.length >= 6 && tl.replace(/[^a-z0-9]+/g, '').includes(dSquash)) return 100
 
   // Split dir name on hyphens/underscores into tokens; skip tokens < 4 chars
   // (avoid matching short abbreviations like "ai", "ui", "rta" out of context)
   const tokens = dl.split(/[-_]+/).filter(t => t.length >= 4)
-  // Require ≥2 meaningful tokens for partial matching — mirrors server-side
-  // scoreProject. A dir reduced to ONE generic token (e.g. rta-blueprint-api →
+  // Require ≥2 meaningful tokens for partial matching. A dir reduced
+  // to ONE generic token (e.g. acme-blueprint-api →
   // ["blueprint"]) would otherwise score a perfect ratio on a shared word and
-  // beat the dir the user actually named (rta-blueprint-react-ui-azure, which
+  // beat the dir the user actually named (acme-blueprint-react-ui-azure, which
   // dilutes its ratio with the unmatched "react" token). Single-name dirs still
   // match verbatim/squashed above (returns 100 when the whole word appears).
   if (tokens.length < 2) return 0
@@ -306,11 +306,21 @@ export function useConstellationTree(
   // (or the open was a no-op). Callers chaining sequential opens (the AI
   // fan-out queue in onOrbArrived) await this so they don't race the browseDir
   // network round-trip and overwrite the orb target before addSystem parks it.
-  const openDir = useCallback((dirId: string, fromSystemId: string, enterFrom?: Pt): Promise<void> => {
+  // `explicitPath` lets a caller open a dir whose node isn't in the map yet —
+  // needed for nested drill-downs (openNestedPath) where a deeper segment's node
+  // is only created once its parent is browsed, and nodesRef lags a render behind
+  // that. When given, we seed a placeholder node so sessions/rendering resolve it.
+  const openDir = useCallback((dirId: string, fromSystemId: string, enterFrom?: Pt, explicitPath?: string): Promise<void> => {
     return new Promise<void>(resolve => {
       if (openSystemsRef.current.some(s => s.dirId === dirId)) { resolve(); return }
       const node = nodesRef.current.get(dirId)
-      if (!node) { resolve(); return }
+      const dirPath = node?.path ?? explicitPath
+      if (!dirPath) { resolve(); return }
+      if (!node) {
+        setNodes(prev => prev.has(dirId) ? prev : new Map(prev).set(dirId, {
+          id: dirId, name: dirId.split('/').pop() ?? dirId, kind: 'dir', path: dirPath,
+        }))
+      }
       if (enterFrom) enterFromRef.current.set(dirId, enterFrom)
 
       const addSystem = (): void => {
@@ -326,7 +336,7 @@ export function useConstellationTree(
         resolve()
       }
 
-      browseDir(node.path)
+      browseDir(dirPath)
         .then(data => {
           if (data.ok) {
             setNodes(prev => {
@@ -337,8 +347,8 @@ export function useConstellationTree(
                 next.set(childId, { id: childId, name: d.name, kind: 'dir', path: d.path })
                 childIds.push(childId)
               }
-              const updated = next.get(dirId)
-              if (updated) next.set(dirId, { ...updated, children: childIds, files: data.files ?? [] })
+              const updated = next.get(dirId) ?? { id: dirId, name: dirId.split('/').pop() ?? dirId, kind: 'dir' as const, path: dirPath }
+              next.set(dirId, { ...updated, children: childIds, files: data.files ?? [] })
               return next
             })
           }
@@ -405,12 +415,56 @@ export function useConstellationTree(
   // all along; this just gets the UI to reflect both.
   const pendingOpensRef = useRef<Array<{ dirId: string; from: string }>>([])
 
+  // Open a nested target ("clients/acme-web-app") by drilling one segment
+  // at a time: open each ancestor so its children load, then enter the deepest.
+  // Top-level node ids are NOT bare names (the projects route ids them
+  // "dir-<name>"), so the first segment is resolved by NAME among root's
+  // children; deeper segments use openDir's deterministic "<parentId>/<name>" id
+  // and a path derived from the parent (nodesRef lags a render behind each open,
+  // so we compute ids/paths rather than read them back).
+  const nestedInFlightRef = useRef<Set<string>>(new Set())
+  const openNestedPath = useCallback(async (targetName: string): Promise<void> => {
+    if (nestedInFlightRef.current.has(targetName)) return
+    nestedInFlightRef.current.add(targetName)
+    try {
+      const segs = targetName.split('/').filter(Boolean)
+      if (segs.length === 0) return
+      const rootNode = nodesRef.current.get('root')
+      const seg0 = (rootNode?.children ?? []).find(id => {
+        const n = nodesRef.current.get(id)
+        return !!n && n.name.toLowerCase() === segs[0].toLowerCase()
+      }) ?? bestDirMatch(segs[0], rootNode, nodesRef.current)
+      if (!seg0) return
+      let curId: string = seg0
+      let curPath: string | undefined = nodesRef.current.get(curId)?.path
+      if (!openSystemsRef.current.some(s => s.dirId === curId)) {
+        await openDir(curId, 'root', undefined, curPath)
+      }
+      for (let i = 1; i < segs.length; i++) {
+        const childId: string = `${curId}/${segs[i]}`
+        const childPath: string | undefined = curPath ? `${curPath}/${segs[i]}` : undefined
+        if (!openSystemsRef.current.some(s => s.dirId === childId)) {
+          await openDir(childId, curId, undefined, childPath)
+        }
+        curId = childId
+        curPath = childPath
+      }
+      // Land focus on the deepest ring (no-op if openDir already parked there).
+      setActiveSystemId(curId)
+      setOrbTarget({ type: 'system', systemId: curId })
+    } finally {
+      nestedInFlightRef.current.delete(targetName)
+    }
+  }, [openDir])
+
   const ensureSystemOpen = useCallback((targetName: string) => {
     if (!targetName || !nodesRef.current.size) return
 
     // Already open — move the visual focus (orb + activeSystemId) to it.
     // The orb tracks WHERE THE CONVERSATION IS; referencing an open dir
     // pulls the orb back to it. Voice routing stays on root regardless.
+    // nodeMatchesTarget matches a nested target via the node's path suffix,
+    // so a re-reference of an already-open nested ring refocuses correctly.
     const existing = openSystemsRef.current.find(s =>
       nodeMatchesTarget(nodesRef.current.get(s.dirId), targetName),
     )
@@ -420,7 +474,15 @@ export function useConstellationTree(
       return
     }
 
-    // Find ID in root's children — try exact match first, then fuzzy
+    // Nested target (multi-segment path) — drill in. Top-level fuzzy matching
+    // can only resolve a bare project name, never a "group/child" path, so a
+    // nested open would otherwise stop at the group ring.
+    if (targetName.includes('/')) {
+      void openNestedPath(targetName)
+      return
+    }
+
+    // Single-segment: existing exact-or-fuzzy match, opened via the orb-walk queue.
     const rootNode = nodesRef.current.get('root')
     const exactMatch = (rootNode?.children ?? []).find(id =>
       nodeMatchesTarget(nodesRef.current.get(id), targetName),
@@ -440,7 +502,7 @@ export function useConstellationTree(
     if (pendingOpensRef.current.length === 1) {
       setOrbTarget({ type: 'dot', systemId: 'root', dirId: match })
     }
-  }, [])
+  }, [openNestedPath])
 
   // Orb reached its target dot — open the head of the pending queue. After
   // addSystem fires (parks orb on the new system) we check the queue and walk

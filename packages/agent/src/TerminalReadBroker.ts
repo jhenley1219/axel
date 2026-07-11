@@ -22,7 +22,7 @@ export type ReadTerminalArgs = {
 }
 
 export type ReadTerminalResult =
-  | { ok: true; target: string; term: string; text: string; source: 'transcript' | 'raw' | 'mixed' }
+  | { ok: true; target: string; term: string; text: string; source: 'full' | 'transcript' | 'raw' | 'mixed' }
   | { ok: false; error: string }
 
 export type TerminalReadHandler = (args: ReadTerminalArgs) => Promise<ReadTerminalResult>

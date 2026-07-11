@@ -18,6 +18,10 @@ export type StreamRequest = {
   systemPrompt?: string
   tools?: Array<ToolSpec>
   abortSignal?: AbortSignal
+  // Provider-specific sampling overrides (e.g. Ollama `options`: temperature,
+  // seed). Left undefined in normal app use so provider defaults apply; the
+  // tool-calling harness pins temperature to 0 for reproducible measurement.
+  options?: Record<string, unknown>
 }
 
 export type ProviderOpts = {

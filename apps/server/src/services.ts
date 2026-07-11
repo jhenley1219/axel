@@ -3,6 +3,7 @@ import { AgentOrchestrator, AppBroker, AskBroker, AxelAgent, CleanupBroker, Clau
 import type { AgentRuntime, ModelProvider, Tier } from '@axel/agent'
 import { AuditLogger } from '@axel/core'
 import type { AppSettings, PermissionMode } from '@axel/core'
+import { ObservabilityRecorder } from '@axel/observability'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { performance } from 'node:perf_hooks'
 import path from 'path'
@@ -29,6 +30,9 @@ export const queueBroker = new RequestQueue()
 export const pairTokenStore = new PairTokenStore()
 export const sessionStore = new SessionStore(() => performance.now())
 export const defaultToolRegistry = buildDefaultRegistry()
+// Records every interaction (UI snapshots + backend conversation feed) per
+// session; read back by the axel-observe MCP server for UI-vs-backend debugging.
+export const observability = new ObservabilityRecorder(config.observabilityDir, config.observabilityEnabled)
 
 const getApiKey = async (): Promise<string | undefined> => (await settingsManager.getSettings()).apiKeys?.anthropic
 const getRunSettings = async (): Promise<{ permissionMode?: AppSettings['permissionMode']; model?: string; effort?: AppSettings['effortLevel'] }> => {
@@ -62,6 +66,7 @@ export const selectAgentRuntime = (settings: AppSettings): AgentRuntime => {
         permissionBroker,
         getPermissionMode,
         getTier,
+        onTurn: (axelSessionId, rec) => observability.turn(axelSessionId, rec),
       },
       { getRunSettings },
     )
@@ -169,6 +174,12 @@ export const orchestrator = new AgentOrchestrator({
   mcpRegistryDir: config.mcpRegistryDir,
   getAgent: () => selectAgentRuntime(settingsManager.getCachedSettings()),
   permissionBroker,
+  // Local tiers (small Ollama models) get the short PromptBuilder prompt; the
+  // full ~17k-char prompt overwhelms them. Resolved per-turn from settings.
+  isCompactModel: () => {
+    const tier = settingsManager.getCachedSettings().modelTier
+    return tier === 'q4-local' || tier === 'q2-local'
+  },
 })
 export type StoredCredentials = {
   username: string

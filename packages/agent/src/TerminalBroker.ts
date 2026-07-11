@@ -6,11 +6,14 @@
 export type OpenTerminalArgs = {
   directory?: string
   prompt?: string
-  // Reuse an existing terminal in the target dir instead of spawning a new
-  // PTY. Pass the `term` id surfaced in the root agent's BACKGROUND TERMINALS
-  // section (the `[t-xxxxxxxx]` tag). If the id doesn't match a live PTY the
-  // handler falls back to opening a fresh terminal — no error.
+  // The specific terminal to send this to (the `[t-xxxxxxxx]` tag or "main"
+  // from the BACKGROUND TERMINALS section). Omit to reuse the target's current
+  // terminal by default — a follow-up continues the same conversation.
   term?: string
+  // Force a brand-new terminal instead of reusing the target's current one.
+  // ONLY set this when the user explicitly wants to work on something in
+  // parallel — a separate conversation alongside the existing one.
+  new?: boolean
 }
 export type OpenTerminalResult =
   | { ok: true; target: string; term: string; reused: boolean }

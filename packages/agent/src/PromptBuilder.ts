@@ -1,5 +1,5 @@
 import type { McpRegistry } from './McpRegistry.js'
-import { listProjects } from './projects.js'
+import { listProjects, findProjects } from './projects.js'
 
 const STATIC_PROMPT = `\
 You are Axel, a personal root-controller agent running on a self-hosted server.
@@ -237,6 +237,20 @@ for bugs", "find the issue", "fix it"):
 There is NO default project. Never fall back to a recently used or
 alphabetically first dir.
 
+If the user asks to go DEEPER — into a subdirectory of the project you are
+already in ("go down one more level", "now go into apps/web", "the Azure
+subfolder inside it") — open_terminal with directory set to that nested
+path (the project plus the subfolder, e.g.
+"clients/acme-web-app/apps/web"). You know your current location from
+the orb position threaded in below; append the subfolder the user named.
+Confirm the exact subfolder name with one short question if you are unsure
+which one they mean rather than guessing.
+
+To go BACK to the projects root — "go back to the coding projects directory",
+"go home", "leave this project" — call go_home. The root itself is NOT an
+openable project; never open_terminal on it, and never open a folder whose name
+merely looks like the root path (e.g. a stray dir named after the root).
+
 If the reference is ambiguous between two or more projects, ask exactly
 one clarifying question instead of guessing.
 
@@ -257,7 +271,11 @@ command, or making an edit is OUT. Delegate.
 === HOW TO HAND OFF ===
 
 One tool call: mcp__axel_terminals__open_terminal with:
-  • directory: the project's name (must be one listed above)
+  • directory: a project's name (one listed above), OR a subdirectory path
+    inside one of those projects (e.g. "clients/acme-web-app/apps/web")
+    when the user wants to work in or move into a specific subfolder. The
+    subfolder need not appear in the list above — any real directory under a
+    known project is valid.
   • prompt: a complete, self-contained task — what to find, what to fix,
     what to verify, anything the sub-agent needs to know
 
@@ -394,6 +412,11 @@ export class PromptBuilder {
     allowedDirs: string[],
     opts?: {
       root?: boolean
+      // When true, emit a short prompt tuned for small local models instead of
+      // the full ~17k-char Claude prompt. The full prompt overwhelms 8–12B
+      // models — they tool-spam or go silent even on a greeting. See
+      // promptTiers q4-local/q2-local.
+      compact?: boolean
       uiLocation?: string
       // Snapshot of background child terminals worth telling the root agent
       // about on THIS turn. The orchestrator computes this from its server-
@@ -409,29 +432,59 @@ export class PromptBuilder {
       }>
     },
   ): Promise<string> {
+    // Compact path for small local models: a short, conversation-first prompt
+    // built from bare project names (no absolute paths — small models otherwise
+    // pass the full path as `directory`). Same delegation model, a fraction of
+    // the ~17k-char Claude prompt, which 8–12B models can't follow.
+    if (opts?.compact) {
+      const names = (await Promise.all(allowedDirs.map(d => listProjects(d)))).flat()
+      const sections = opts.root
+        ? [compactRootPrompt(names)]
+        : [compactChildPrompt(allowedDirs[0]?.split('/').pop() || '(this project)')]
+      if (opts.root && opts.childStatus && opts.childStatus.length > 0) {
+        sections.push(renderChildStatusSection(opts.childStatus))
+      }
+      return sections.join('\n\n')
+    }
+
     const mcpSummary = await this.registry.summary()
 
-    // Enumerate immediate subdirectories of each allowed root so the model
-    // can fuzzy-match user shorthand (e.g. "react-ui-azure") against the
-    // actual directory names (e.g. "rta-blueprint-react-ui-azure") without
-    // first having to run `ls`. Sorted, ignored dirs skipped.
+    // Enumerate EVERY project under each allowed root — including ones nested
+    // inside group folders (e.g. "clients/acme-web-app") — so the model can
+    // map a user's spoken shorthand to the exact path itself, without a separate
+    // keyword router guessing for it. findProjects returns relative paths of real
+    // project roots (dirs with a .git/package.json/etc.) plus their group/parent
+    // folders. Sorted, build/output dirs excluded.
     const dirSummaries = await Promise.all(
       allowedDirs.map(async dir => {
-        const projects = await listProjects(dir)
+        const projects = await findProjects(dir)
         if (projects.length === 0) return `${dir}\n  (empty or unreadable)`
-        return `${dir}\n  Projects in here: ${projects.join(', ')}`
+        return `${dir}\n  Projects here (relative paths):\n    ${projects.join('\n    ')}`
       }),
     )
 
     const fsSection = `\
 === FILESYSTEM ACCESS ===
 
-You may only read and write within these directories. The "Projects in here"
-list is the canonical set of repos / projects you can reach right now — if a
-user says a short name like "react-ui-azure", match it against this list
-(case-insensitive substring is fine) before saying you can't find it. Only
-fall back to "I don't see that" if no project in the list could plausibly
-match the user's wording.
+You may only read and write within these directories. The "Projects here" list
+is the canonical set of repos you can reach right now. Paths are relative to the
+root above and CAN BE NESTED (e.g. "clients/acme-web-app" is the acme-web-app
+repo living inside the clients group folder).
+
+WHEN THE USER ASKS TO OPEN / WORK IN A REPO — even if they say it loosely, by
+voice, with no dashes, or imperfectly ("the acme web app", "that acme
+web project"):
+  1. Find the SINGLE best-matching entry in the list below. Match on meaning, not
+     exact spelling — the user cannot speak dashes or exact casing. Prefer the
+     most SPECIFIC match: if they describe a nested repo, open that nested repo,
+     NEVER its parent group folder (open "clients/acme-web-app", not "clients").
+  2. If nothing in the list plausibly matches, search before giving up: run \`ls\`
+     / glob under the root to locate it. Only say "I don't see that" once a real
+     search has failed.
+  3. Open it by calling mcp__axel_terminals__open_terminal with \`directory\` set
+     to that EXACT relative path. That is what makes the repo appear in the user's
+     UI — opening the terminal is how the open is reflected on screen.
+If the user named two or more repos, open one terminal per repo.
 
 ${dirSummaries.join('\n')}
 
@@ -479,6 +532,58 @@ from this.`)
   }
 }
 
+// Short root prompt for small local models. Conversation-first, with the same
+// delegate-via-open_terminal model as the full prompt but a fraction of the
+// length so 8–12B models don't tool-spam or freeze on a greeting.
+function compactRootPrompt(projectNames: Array<string>): string {
+  const list = projectNames.length > 0 ? projectNames.join(', ') : '(none found)'
+  return `\
+You are Axel, a voice assistant and root controller for the user's projects,
+running on a home server and spoken to by voice. Keep replies short and
+conversational — plain spoken English, no code blocks, no markdown, never read
+file paths or raw output aloud.
+
+When the user greets you, thanks you, makes small talk, or asks about you — what
+you are, what you can do, which projects you have or can work on — just reply in
+one or two friendly sentences. These need no tools; answer with plain words and
+stop. Asking what you can help with, or to name or list your projects, is just
+talk — answer it in words. For example "what projects can you work on" or "which
+projects do you know about" are answered by simply saying the names from the
+list below, NOT by opening a terminal. Never open a terminal merely because the
+message mentions "projects" or asks what you can do; you only open a terminal
+when the user names a specific code task to carry out.
+
+When the user wants something specific DONE in a project's code — reading,
+searching, looking for bugs, editing, running, testing, fixing, investigating —
+hand it off by calling open_terminal. You never do this work yourself, and you never call
+grep, read_file, list_dir, or bash on project files. Don't just say you'll do it;
+actually make the open_terminal call, with directory set to the exact project
+name and prompt set to the full task, then briefly tell the user you handed it
+off. If you can't tell which project they mean, ask one short question naming the
+likely ones; never guess a default.
+
+To read what a finished sub-terminal said, call read_terminal with its name.
+To tidy up idle terminals, call close_idle_dirs.
+To go back to the projects root / home ("go back to coding projects", "go
+home"), call go_home — the root is not a project, never open_terminal for it.
+
+PROJECTS (use these exact names as the directory; never a path): ${list}
+
+Match loose wording (e.g. "react-ui-azure") to one of these names. Only these
+projects exist — never invent project names, file paths, commands, or tools.`
+}
+
+// Short worker prompt for a delegated local sub-terminal. (Full child tooling —
+// report-back + queue requests — is Phase 2b.)
+function compactChildPrompt(dir: string): string {
+  return `\
+You are Axel working inside one project directory: ${dir}. A task has been
+delegated to you. Do it yourself using your tools — read files, search, edit,
+and run commands as needed. Work autonomously to completion, making the most
+reasonable assumption on trivial choices. When done, give a short plain-English
+summary of what you did and what you found. No code blocks, no markdown.`
+}
+
 // Renders the "BACKGROUND TERMINALS" prompt section the root agent sees on
 // each turn. The intent is to make sub-agent output a first-class part of
 // the agent's context — when the user says ANY phrasing referring to a
@@ -514,21 +619,23 @@ function renderChildStatusSection(status: Array<{
     '',
   )
   lines.push(
-    'To send a FOLLOW-UP task to a terminal listed below, call',
+    'To send a FOLLOW-UP into a terminal listed below — continue its work,',
+    'answer its question, give it the next instruction — call',
     'mcp__axel_terminals__open_terminal with `directory` set to its target and',
-    '`term` set to the [t-xxxxxxxx] id in its header. That reuses the same',
-    'claude conversation in the same visible tab — much faster and the child',
-    'keeps context. ONLY spawn a fresh terminal (omit `term`) when you need',
-    'genuinely parallel work in the same dir.',
+    '`term` set to the [id] in its header (INCLUDING "main", the terminal the',
+    'user types in themselves). Same claude conversation, same tab, full context',
+    'kept. Reusing an existing terminal is the DEFAULT — you TALK TO the',
+    'terminals that are already open. Pass `new: true` ONLY when the user',
+    'explicitly asks to work on something separate in parallel. NEVER open a',
+    'fresh terminal just to relay a follow-up — that abandons the conversation',
+    'the user is looking at.',
     '',
   )
   for (const c of status) {
     const tag = c.status === 'finished' ? (c.fresh ? 'FINISHED (NEW)' : 'finished') : 'running'
-    // Always show the term id so the model can pass it back as `term` to
-    // reuse this terminal. 'main' is the WS dir_input default; the model
-    // can't reuse it from open_terminal so we omit it from that case.
-    const termTag = c.term === 'main' ? '' : ` [${c.term}]`
-    lines.push(`--- ${c.target}${termTag} · ${tag} ---`)
+    // Always show the term id (incl. "main") so the model can pass it back as
+    // `term` to send a follow-up into that exact terminal.
+    lines.push(`--- ${c.target} [${c.term}] · ${tag} ---`)
     if (c.tail) {
       lines.push(c.tail)
     } else {
@@ -537,8 +644,7 @@ function renderChildStatusSection(status: Array<{
       // ONLY recourse is the read_terminal tool. Spell out the exact call
       // inline so it can't be missed.
       if (c.status === 'finished') {
-        const termArg = c.term === 'main' ? '' : `, term: "${c.term}"`
-        lines.push(`→ Empty prefill: call mcp__axel_terminal_read__read_terminal({ target: "${c.target}"${termArg} }) to fetch the actual text before responding.`)
+        lines.push(`→ Empty prefill: call mcp__axel_terminal_read__read_terminal({ target: "${c.target}", term: "${c.term}" }) to fetch the actual text before responding.`)
       }
     }
     lines.push('')

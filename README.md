@@ -160,6 +160,7 @@ packages/agent Agent orchestrator, runtimes (ClaudeCode / PTY / in-tree Axel), M
 packages/core  Shared types + execution utilities (audit log, path allowlist, spawn env)
 packages/auth  Password hashing, signed sessions, rate limiting
 packages/stt   Speech-to-text provider interface (browser STT is used today)
+packages/observability Local session recorder + axel-observe MCP server for UI-vs-backend diagnostics
 python         Local TTS (Piper / Kokoro) and the Claude OAuth helper
 bin            CLI launchers (axel.js, axel-docker-init.js)
 ```

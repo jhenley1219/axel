@@ -29,7 +29,11 @@ export type InstalledToolView = {
 // tabs); missing term means the dir's default terminal ('main').
 export type AgentWireMessage =
   | { type: 'token'; value: string; target?: string; term?: string }
-  | { type: 'message_end'; target?: string; term?: string }
+  // `reported` marks the synthetic message_end a child emits via the report
+  // tool — the authoritative "I have finished my task" signal. The auto-wake
+  // keys off this so the root is pinged on real completion, not on a heuristic
+  // idle/scrape that can fire during a mid-work pause.
+  | { type: 'message_end'; target?: string; term?: string; reported?: boolean }
   // Per-call tool lifecycle. `invocationId` is the claude stream's tool_use id,
   // which the matching tool_result references — same value flows on tool_use →
   // (optional tool_progress) → tool_end. The UI keys per-bubble activity
@@ -118,6 +122,9 @@ export type AgentWireMessage =
   // same actions a user click triggers.
   | { type: 'ui_open_file'; path: string; target?: string; term?: string }
   | { type: 'ui_open_dir'; path: string; target?: string; term?: string }
+  // Return the orb to the projects root — backs the go_home tool. The root is
+  // not an openable target, so "go back to coding projects / home" focuses root.
+  | { type: 'ui_focus_root' }
   // Sent once per WS connection right after auth, so a freshly-opened tab is
   // in sync without waiting for a registry change. Clients REPLACE their
   // bubble-bar list. Idempotent.
@@ -139,4 +146,7 @@ export type AgentWireMessage =
   // The client connects an xterm.js view to /agent/pty/<spawnId> for bytes both
   // directions. One emission per PTY lifetime — re-emitted if the PTY is closed
   // and reopened on a later turn.
-  | { type: 'pty_ready'; spawnId: string; target?: string; term?: string }
+  // claudeSessionId + cwd let the orchestrator locate this terminal's persisted
+  // Claude JSONL transcript (~/.claude/projects/<slug(cwd)>/<id>.jsonl) so the
+  // root agent can read its full conversation on demand, even after the PTY dies.
+  | { type: 'pty_ready'; spawnId: string; target?: string; term?: string; claudeSessionId?: string; cwd?: string }

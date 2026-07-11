@@ -27,20 +27,33 @@ mcpCleanupRouter.post('/mcp/cleanup/:spawnId', async (req, res) => {
   )
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [{
-      name: 'close_idle_dirs',
-      description:
-        'Close any open project directories with no active work — no in-flight runs in any of the dir\'s terminals. Use this to tidy up after a batch of tasks finishes, so the constellation only shows dirs still doing something. Returns the list of dirs that were closed.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
+    tools: [
+      {
+        name: 'close_idle_dirs',
+        description:
+          'Close any open project directories with no active work — no in-flight runs in any of the dir\'s terminals. Use this to tidy up after a batch of tasks finishes, so the constellation only shows dirs still doing something. Returns the list of dirs that were closed.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
       },
-    }],
+      {
+        name: 'go_home',
+        description:
+          'Return the user\'s view to the projects root (their "coding projects" home). Use when the user asks to go back to the root / coding-projects directory, go home, or leave the current project WITHOUT opening another. The projects root is NOT an openable project — never call open_terminal for it; call this instead.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ],
   }))
 
-  server.setRequestHandler(CallToolRequestSchema, async () => {
-    const result = await cleanupBroker.closeIdle(spawnId, {})
+  server.setRequestHandler(CallToolRequestSchema, async request => {
+    const action = request.params.name === 'go_home' ? 'go_home' : 'close_idle'
+    const result = await cleanupBroker.closeIdle(spawnId, { action })
     return { content: [{ type: 'text', text: JSON.stringify(result) }] }
   })
 

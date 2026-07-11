@@ -13,7 +13,7 @@ const resolveSandboxed = (input: string, ctx: ToolContext): string | null => {
 export const openFileInUI: Tool = {
   name: 'open_file_in_ui',
   description:
-    'Open a file in the Axel constellation UI so the user can VIEW it visually. Use this when the user says "open the file" or "show me the file" — NOT read_file. read_file returns text content for you to reason about; open_file_in_ui makes the file appear in the user\'s window.',
+    'Open a file in the Axel constellation UI so the user can VIEW it visually. Use this only when the user wants the file displayed on their screen — "open the file", "show me the file in the editor", "pop it up in my UI". Do NOT use it merely to read, print, cat, or learn what a file says or contains — that is read_file. open_file_in_ui makes the file appear in the user\'s window; it returns no contents.',
   inputSchema: {
     type: 'object',
     required: ['path'],
@@ -32,7 +32,7 @@ export const openFileInUI: Tool = {
 export const openDirInUI: Tool = {
   name: 'open_dir_in_ui',
   description:
-    'Open a directory (project) in the Axel constellation UI so the user can SEE it as a system ring. Use this when the user says "open the directory" or "show me the project" — NOT list_dir. list_dir returns text contents; open_dir_in_ui makes the directory appear as a visual system in the user\'s window.',
+    'Open a directory (project) in the Axel constellation UI so the user can SEE it as a system ring. Use this only when the user wants the directory displayed visually — "open the directory", "show me the project", "in my UI/sidebar/file tree". Do NOT use it merely to find out what a directory contains or to list its entries — that is list_dir. open_dir_in_ui makes the directory appear as a visual system in the user\'s window; it returns no contents.',
   inputSchema: {
     type: 'object',
     required: ['path'],

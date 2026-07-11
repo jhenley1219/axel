@@ -33,7 +33,7 @@ mcpTerminalReadRouter.post('/mcp/terminal_read/:spawnId', async (req, res) => {
     tools: [{
       name: 'read_terminal',
       description:
-        'Read the recent text from one of your sub-terminals. Use this whenever the BACKGROUND TERMINALS section looks empty / says "(no output yet)" / shows garbled TUI fragments — it pulls the live text straight out of the terminal so you have something real to read to the user. Pass `target` (the project dir name from the BACKGROUND TERMINALS header) and optionally `term` (the [t-xxxxxxxx] id; defaults to "main"). Set `raw: true` if the cleaned text looks over-stripped and you need the unfiltered PTY tail (last 4KB of ANSI-stripped output).',
+        'Read the COMPLETE conversation of one of your sub-terminals — every user prompt, assistant reply, and tool call, straight from the terminal\'s persisted transcript. Use whenever the BACKGROUND TERMINALS section looks empty / says "(no output yet)" / shows garbled TUI fragments — this returns the real, full conversation instead. Pass `target` (the project dir name from the BACKGROUND TERMINALS header). Omit `term` to list every terminal open for that project and read the most recent; pass `term` (the [t-xxxxxxxx] id, or "main") to read a specific one. Set `raw: true` only if you need the unfiltered live PTY tail (last 4KB of ANSI-stripped output).',
       inputSchema: {
         type: 'object',
         required: ['target'],

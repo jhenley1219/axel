@@ -18,7 +18,7 @@ const resolveSandboxed = (input: string, ctx: ToolContext): string | null => {
 
 export const readFile: Tool = {
   name: 'read_file',
-  description: 'Read a UTF-8 text file. Output is capped at 256KB; longer files are truncated with a "[truncated]" marker.',
+  description: 'Read a UTF-8 text file and return its CONTENTS as text for you to use. Use this whenever the user wants to know what a file contains or says — "read", "cat", "print/dump the contents", "what does it contain", "what\'s inside", "what does it say". This does NOT display the file on the user\'s screen; to make a file appear visually in their UI, use open_file_in_ui instead. Output is capped at 256KB; longer files are truncated with a "[truncated]" marker.',
   inputSchema: {
     type: 'object',
     properties: { path: { type: 'string' } },
@@ -105,7 +105,7 @@ export const editFile: Tool = {
 
 export const listDir: Tool = {
   name: 'list_dir',
-  description: 'List entries of a directory. Each line is "<type>\\t<name>" where type is "file" or "dir".',
+  description: 'List the immediate entries of ONE directory as text. Prefer this over running `ls` through bash. Use it to see what files and folders a directory directly contains. To find files by name or pattern across a whole tree use glob; to display a directory visually in the user\'s UI use open_dir_in_ui. Each line is "<type>\\t<name>" where type is "file" or "dir".',
   inputSchema: {
     type: 'object',
     properties: { path: { type: 'string' } },
@@ -170,7 +170,7 @@ const walk = async (root: string, rel: string, re: RegExp, hits: Array<string>):
 
 export const glob: Tool = {
   name: 'glob',
-  description: 'Find files matching a glob pattern (supports *, **, ?). Returns one relative path per line.',
+  description: 'Find files by their NAME or by a filename pattern (supports *, **, ?) — e.g. "**/*.ts" for every TypeScript file. Use this, NOT list_dir, when the request names a filename pattern or extension (.ts, .md, .json). This matches file NAMES only; to search the TEXT inside files use grep. Returns one relative path per line.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -198,7 +198,7 @@ const hasBin = async (bin: string): Promise<boolean> => new Promise(resolveP => 
 
 export const grep: Tool = {
   name: 'grep',
-  description: 'Search for a pattern in files. Uses ripgrep if available, otherwise grep. Output capped at 8KB.',
+  description: 'Search for a string or pattern INSIDE file contents across a directory tree (uses ripgrep if available, otherwise grep). Use this — NOT read_file, NOT glob — whenever the user wants to find where text appears, which lines contain something, to "look through the files for" a word, or to "search the code" for a word. glob matches file names; grep matches what is written inside the files. Output capped at 8KB.',
   inputSchema: {
     type: 'object',
     properties: {

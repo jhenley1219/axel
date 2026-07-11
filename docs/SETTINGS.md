@@ -49,6 +49,14 @@ These are read at process startup from the environment (or `.env` file). Changin
 |---|---|---|---|
 | `PYTHON_PATH` | string | `python3` | Path to the Python 3 interpreter. Used by the server-side TTS engines (Piper, Kokoro). |
 
+### Observability & diagnostics
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `OBSERVABILITY_ENABLED` | boolean | `true` | Records each session's interaction feed (user inputs, wire events, raw model turns, throttled UI-state snapshots) to local JSONL files so the bundled `axel-observe` MCP server can diagnose UI-vs-backend divergence. Recordings never leave your machine. Set to `false` to disable recording entirely. |
+| `OBSERVABILITY_DIR` | string | `<WORKSPACE_ROOT>/data/observability`, else `./data/observability` | Directory where per-session observability recordings are written. |
+| `AXEL_TERMINAL_READ_MAX_CHARS` | number | `80000` | Cap on a single `read_terminal` result. The full conversation always persists on disk; when it exceeds this cap the most recent slice is returned with a truncation marker so one enormous terminal cannot blow the root agent's context. |
+
 ### Git / GitHub
 
 | Variable | Type | Default | Description |

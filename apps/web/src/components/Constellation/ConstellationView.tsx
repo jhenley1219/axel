@@ -80,6 +80,7 @@ export function ConstellationView(): React.ReactElement {
   // real callbacks once available.
   const onUIOpenDirRef  = useRef<(path: string) => void>(() => {})
   const onUIOpenFileRef = useRef<(path: string) => void>(() => {})
+  const onUIFocusRootRef = useRef<() => void>(() => {})
 
   // Where the orb sits, in words — kept current below (orbTarget lives in the
   // tree hook, declared after this) and read at send time inside the voice hook.
@@ -89,6 +90,7 @@ export function ConstellationView(): React.ReactElement {
   const voice = useVoiceInterface({
     onUIOpenDir:  path => onUIOpenDirRef.current(path),
     onUIOpenFile: path => onUIOpenFileRef.current(path),
+    onUIFocusRoot: () => onUIFocusRootRef.current(),
     getLocation:  () => locationRef.current,
   })
   const {
@@ -106,6 +108,7 @@ export function ConstellationView(): React.ReactElement {
     installedTools, activeInvocations,
     timerState, notesState, dispatchApp,
     clearSession,
+    constellationRef, requestUiSnapshot,
   } = voice
 
   // Which app popup is open (null = none). Click a bubble for a built-in app
@@ -136,6 +139,19 @@ export function ConstellationView(): React.ReactElement {
   useEffect(() => {
     locationRef.current = describeOrbAnchor(orbTarget, nodes, rootDirId)
   }, [orbTarget, nodes, rootDirId])
+
+  // Feed orb/ring state into the observability snapshot and poke a send when it
+  // settles. Opens resolve asynchronously (browseDir round-trips), often after
+  // the message-driven throttle has already fired — without this poke the
+  // recorded snapshot would miss the orb finally landing in the nested ring.
+  useEffect(() => {
+    constellationRef.current = {
+      activeSystemId,
+      orbTarget,
+      openSystems: openSystems.map(s => ({ dirId: s.dirId, parentSystemId: s.parentSystemId })),
+    }
+    requestUiSnapshot()
+  }, [activeSystemId, orbTarget, openSystems, constellationRef, requestUiSnapshot])
 
   // ── Engine — single rAF clock, lerped keyframes ───────────────────────────
   const stage = useMemo<Stage>(() => ({
@@ -500,6 +516,7 @@ export function ConstellationView(): React.ReactElement {
   }, [nodes])
 
   useEffect(() => {
+    onUIFocusRootRef.current = () => focusSystem(rootDirId)
     onUIOpenDirRef.current = (path: string) => {
       for (const node of nodes.values()) {
         if (node.kind !== 'dir' || node.path !== path) continue

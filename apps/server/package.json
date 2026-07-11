@@ -15,6 +15,7 @@
     "@axel/agent": "workspace:*",
     "@axel/auth": "workspace:*",
     "@axel/core": "workspace:*",
+    "@axel/observability": "workspace:*",
     "@axel/stt": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cookie": "^1.1.1",

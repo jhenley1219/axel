@@ -19,6 +19,8 @@ export type PermissionRequest = { id: string; toolName: string; input?: unknown 
 export type VoiceInterfaceOptions = {
   onUIOpenFile?: (path: string) => void
   onUIOpenDir?:  (path: string) => void
+  // Return the orb to the projects root (backs the agent's go_home tool).
+  onUIFocusRoot?: () => void
   // Human description of where the orb currently sits in the constellation,
   // read at send time and shipped with the prompt so the root agent knows
   // its own on-screen location.
@@ -841,6 +843,11 @@ export function useVoiceInterface(options: VoiceInterfaceOptions = {}) {
         // key's appearance also triggers the constellation to open the ring.
         const key = termKey(msg.target, msg.term)
         setTargetMessages(prev => key in prev ? prev : { ...prev, [key]: [] })
+        // Always refocus the orb on this target — even on reuse, where the
+        // buffer key already exists so the targetMessages trigger won't fire.
+        // Same pattern as target_start / queue_claimed: setCurrentTarget drives
+        // ensureSystemOpen, which drills into the (possibly nested) ring.
+        setCurrentTarget(msg.target)
         return
       }
 
@@ -998,6 +1005,11 @@ export function useVoiceInterface(options: VoiceInterfaceOptions = {}) {
         return
       }
 
+      if (msg.type === 'ui_focus_root') {
+        optionsRef.current.onUIFocusRoot?.()
+        return
+      }
+
       if (msg.type === 'ui_open_file') {
         optionsRef.current.onUIOpenFile?.(msg.path)
         return
@@ -1025,6 +1037,53 @@ export function useVoiceInterface(options: VoiceInterfaceOptions = {}) {
   useEffect(() => {
     savePersistedSession({ messages, targetMessages, fanOut, currentTarget, targetStatus })
   }, [messages, targetMessages, fanOut, currentTarget, targetStatus])
+
+  // ── Ship UI-state snapshots for observability ──────────────────────────────
+  // Like the persistence effect above, but sends the live UI state to the
+  // server (recorded only, never echoed) so the axel-observe MCP server can
+  // diff what the UI rendered against what the backend actually produced. The
+  // builder is reassigned every render so the throttled timer always flushes
+  // the freshest state; throttling keeps token streaming from flooding the WS.
+  const snapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Constellation nav state (which ring the orb is inside) lives in
+  // useConstellationTree, a sibling hook. ConstellationView writes a summary
+  // here each render so the snapshot can record WHERE THE ORB ACTUALLY IS —
+  // the exact UI state that diverges from the backend's open target.
+  const constellationRef = useRef<unknown>(null)
+  const buildSnapshotRef = useRef<() => unknown>(() => null)
+  buildSnapshotRef.current = () => ({
+    capturedAt: new Date().toISOString(),
+    orbState,
+    messages: messages.map(m => ({ role: m.role, text: m.text, streaming: m.streaming, target: m.target })),
+    targetMessages: Object.fromEntries(
+      Object.entries(targetMessages).map(([k, list]) => [k, list.map(m => ({ role: m.role, text: m.text, streaming: m.streaming }))]),
+    ),
+    targetStatus,
+    activeInvocations: activeInvocations.map(i => ({ invocationId: i.invocationId, name: i.toolName, target: i.target, ok: i.ok })),
+    permissionRequests,
+    questionRequests,
+    fanOut,
+    currentTarget,
+    constellation: constellationRef.current,
+    installedToolCount: installedTools.length,
+  })
+  const flushSnapshot = useCallback(() => {
+    snapshotTimerRef.current = null
+    const ws = wsRef.current
+    const snapshot = buildSnapshotRef.current() as { messages: Array<unknown>; targetMessages: Record<string, unknown> }
+    // Skip empty pre-interaction snapshots — nothing to diff yet.
+    if (snapshot.messages.length === 0 && Object.keys(snapshot.targetMessages).length === 0) return
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ui_snapshot', snapshot }))
+  }, [])
+  // Arm the throttled send. Exposed so ConstellationView can request a snapshot
+  // when orb/ring state settles (which happens async after an open, often after
+  // the message-driven throttle window has already fired).
+  const requestUiSnapshot = useCallback(() => {
+    if (snapshotTimerRef.current) return
+    snapshotTimerRef.current = setTimeout(flushSnapshot, 750)
+  }, [flushSnapshot])
+  useEffect(() => { requestUiSnapshot() }, [messages, targetMessages, targetStatus, fanOut, currentTarget, orbState, activeInvocations, permissionRequests, questionRequests, installedTools, requestUiSnapshot])
+  useEffect(() => () => { if (snapshotTimerRef.current) clearTimeout(snapshotTimerRef.current) }, [])
 
   // ── Answer a pending permission prompt ─────────────────────────────────────
   const respondPermission = useCallback((id: string, behavior: 'allow' | 'deny') => {
@@ -1284,5 +1343,9 @@ export function useVoiceInterface(options: VoiceInterfaceOptions = {}) {
     setActiveContext,
     cancelListening: sr.cancel,
     clearSession,
+    // Observability: ConstellationView feeds orb/ring state here + pokes a
+    // snapshot when it settles, so recordings capture where the orb really is.
+    constellationRef,
+    requestUiSnapshot,
   }
 }

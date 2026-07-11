@@ -27,7 +27,7 @@ export type AgentRuntime = {
   // ANSI-stripped window) on demand for the root agent's read_terminal tool.
   // Returns null when the runtime has no session-bound text buffer, or when
   // the runtimeSessionId doesn't resolve.
-  peek?: (runtimeSessionId: string) => { strippedTail: string; turnText: string } | null
+  peek?: (runtimeSessionId: string) => { strippedTail: string; turnText: string; claudeSessionId?: string; cwd?: string } | null
   // Optional teardown hook — called from AgentOrchestrator.resetSession so a
   // UI "new session" click can drop any long-lived child processes (e.g.
   // PtyAgent's per-terminal `claude` TUIs) belonging to this axel session.

@@ -3,6 +3,8 @@ export { ToolRegistry } from './registry.js'
 export { readFile, writeFile, editFile, listDir, glob, grep, registerFileTools } from './files.js'
 export { bashTool, registerBashTool } from './bash.js'
 export { openFileInUI, openDirInUI, registerUITools } from './ui.js'
+export { buildRootOrchestrationTools } from './orchestration.js'
+export type { RootOrchestrationHandlers } from './orchestration.js'
 
 import { ToolRegistry } from './registry.js'
 import { registerFileTools } from './files.js'

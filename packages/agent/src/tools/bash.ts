@@ -62,7 +62,7 @@ const execute = async (input: BashInput, ctx: ToolContext): Promise<ToolResult> 
 
 export const bashTool: Tool = {
   name: 'bash',
-  description: 'Execute a shell command with bounded timeout',
+  description: 'Execute a shell command with bounded timeout. Use for real shell work (git, node, build/test commands, process info). Do NOT reach for bash to list a directory (use list_dir), read a file (use read_file), search file contents (use grep), or find files by name (use glob) — those dedicated tools are preferred even when the user phrases it as a shell command like "ls" or "cat".',
   inputSchema: {
     type: 'object',
     required: ['command'],

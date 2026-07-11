@@ -5,7 +5,8 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { AgentWireMessage } from '@axel/agent'
 import { isPathUnder } from '@axel/core'
 import { config } from '../config.js'
-import { sessionManager, orchestrator, settingsManager, permissionBroker, askBroker, mcpRegistry, appBroker, queueBroker } from '../services.js'
+import { sessionManager, orchestrator, settingsManager, permissionBroker, askBroker, mcpRegistry, appBroker, queueBroker, observability } from '../services.js'
+import type { UiSnapshot } from '@axel/observability'
 
 function send(ws: WebSocket, msg: AgentWireMessage): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -84,7 +85,10 @@ export function createAgentWss(): WebSocketServer {
     // turn. Cheap (reads ~/.axel/mcp-registry once); broadcast updates are
     // handled separately by the registry watcher at boot.
     mcpRegistry.listView()
-      .then(tools => send(ws, { type: 'tool_catalog', tools }))
+      .then(tools => {
+        observability.sessionStart(sessionId, { auth: sessionId !== 'no-auth', tools })
+        send(ws, { type: 'tool_catalog', tools })
+      })
       .catch(err => console.error('[ws] failed to send tool catalog:', err))
 
     // Snapshot the current app state so a freshly-opened tab shows the
@@ -139,15 +143,27 @@ export function createAgentWss(): WebSocketServer {
           : onlyQ
             ? 'A pending request from a background terminal is waiting. Call mcp__axel_queue__list, then claim EXACTLY ONE item, present it to the user in a sentence or two, and END YOUR TURN. Do NOT claim or read additional items in this same turn — the user has to actually answer the one you present before you can hand them the next. Once they answer, you\'ll call resolve() and the next turn will surface the next item. Do not delegate, do not open a new terminal.'
             : 'One or more background terminals just finished. Look at the BACKGROUND TERMINALS section: for EACH entry tagged FINISHED (NEW), surface what they did to the user in plain English. If an entry\'s tail says "(no output yet)" or looks garbled, you MUST call mcp__axel_terminal_read__read_terminal with that terminal\'s dir (and term id if shown) to fetch the actual text before responding. NEVER tell the user "the terminal sent back no output" without trying read_terminal first. Surface every NEW finish — if two terminals finished, mention both. Do not delegate, do not open a new terminal.'
-        runMain(text, undefined, { forceRoot: true })
+        runMain(text, undefined, { forceRoot: true, source: 'wake' })
       }, 50)
     }
 
     // Single fan-out point: every event leaving for the client goes through
     // here so the wake-on-child-done trigger can observe target_done.
     const handleEvent = (event: AgentWireMessage): void => {
+      observability.wireEvent(sessionId, event)
       fanOutEvent(ws, event)
-      if (event.type === 'target_done') noteSignal('child')
+      // Wake the root when a child has genuinely finished with output to
+      // surface. Candidates: a `reported` message_end (the report tool — the
+      // authoritative signal), a plain child message_end (the TUI scrape, which
+      // PtyAgent now emits ONLY on true output-silence, never mid-stream), or a
+      // target_done. hasFreshChildOutput is the gate: it blocks the premature
+      // hard-cap target_done where the child is still streaming and the
+      // transcript is empty — the worst original symptom (empty early queries).
+      // A child that pauses for sub-workers may ping once with partial output;
+      // the root then honestly says "still working", which beats going silent.
+      const childTarget = (event as { target?: string }).target
+      const childDone = event.type === 'target_done' || (event.type === 'message_end' && (event.reported || !!childTarget))
+      if (childDone && orchestrator.hasFreshChildOutput(sessionId)) noteSignal('child')
     }
 
     // Serialize a user prompt onto the main-agent queue. uiLocation is an
@@ -156,7 +172,8 @@ export function createAgentWss(): WebSocketServer {
     // are you?" from the same view the user is looking at. forceRoot bypasses
     // target-detection routing — used by the synthetic wake whose text would
     // otherwise risk matching a project name.
-    const runMain = (userMessage: string, uiLocation?: string, opts?: { forceRoot?: boolean }): void => {
+    const runMain = (userMessage: string, uiLocation?: string, opts?: { forceRoot?: boolean; source?: 'main' | 'plain' | 'wake' }): void => {
+      observability.userInput(sessionId, { text: userMessage, source: opts?.source ?? 'main', uiLocation })
       mainInFlight++
       mainQueue = mainQueue.then(async () => {
         try {
@@ -206,6 +223,7 @@ export function createAgentWss(): WebSocketServer {
           typeof ctrl.id === 'string' &&
           (ctrl.behavior === 'allow' || ctrl.behavior === 'deny')
         ) {
+          observability.controlInput(sessionId, 'permission_response', ctrl)
           permissionBroker.resolve(ctrl.id, ctrl.behavior)
           return
         }
@@ -213,6 +231,7 @@ export function createAgentWss(): WebSocketServer {
         // Answer to a pending question_request — either a chosen index or an
         // explicit cancel. Same resolve-by-id-globally model as permissions.
         if (ctrl?.type === 'question_response' && typeof ctrl.id === 'string') {
+          observability.controlInput(sessionId, 'question_response', ctrl)
           if (ctrl.behavior === 'cancel') {
             askBroker.cancel(ctrl.id)
           } else if (typeof ctrl.index === 'number') {
@@ -225,6 +244,7 @@ export function createAgentWss(): WebSocketServer {
         // the MCP route — both ultimately call AppBroker methods and emit
         // app_state to every client.
         if (ctrl?.type === 'app_action' && typeof ctrl.app === 'string' && typeof ctrl.action === 'string') {
+          observability.controlInput(sessionId, 'app_action', ctrl)
           const a = (ctrl.payload ?? {}) as Record<string, unknown>
           if (ctrl.app === 'timer') {
             if (ctrl.action === 'start')   appBroker.startTimer(Number(a.minutes))
@@ -239,6 +259,14 @@ export function createAgentWss(): WebSocketServer {
           return
         }
 
+        // Client UI-state snapshot — recorded only, never forwarded. Lets the
+        // axel-observe MCP server diff what the UI rendered against what the
+        // backend actually produced.
+        if (ctrl?.type === 'ui_snapshot' && ctrl.snapshot && typeof ctrl.snapshot === 'object') {
+          observability.uiSnapshot(sessionId, ctrl.snapshot as UiSnapshot)
+          return
+        }
+
         if (
           ctrl?.type === 'dir_input' &&
           typeof ctrl.target === 'string' &&
@@ -249,6 +277,7 @@ export function createAgentWss(): WebSocketServer {
           // Which terminal of the target dir this input belongs to — each
           // terminal is an independent claude conversation (tab in the UI).
           const term    = typeof ctrl.term === 'string' && ctrl.term ? ctrl.term : 'main'
+          observability.userInput(sessionId, { text: dirText, source: 'dir', target, term })
 
           // Enqueue on the per-terminal queue (independent from mainQueue,
           // from other targets, and from the same dir's other terminals).
@@ -310,7 +339,7 @@ export function createAgentWss(): WebSocketServer {
       }
 
       // Plain-text user prompt → main orchestrator (serialized)
-      runMain(text)
+      runMain(text, undefined, { source: 'plain' })
     })
   })
 
