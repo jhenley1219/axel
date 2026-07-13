@@ -14,6 +14,25 @@
 
 ---
 
+## What it looks like
+
+Your workspace renders as a constellation: each project is a star orbiting the agent. Type a prompt (or tap the orb and speak) and the agent fans out — here it spins up review terminals in two projects at once and, while they work, opens a file on screen with the dangerous line highlighted for you:
+
+<p align="center">
+  <img src="docs/media/axel-demo.gif" width="830" alt="One typed prompt: the agent asks permission, opens terminals in two projects that work in parallel, and opens a file with a hardcoded API key highlighted in red for review" />
+</p>
+
+| | |
+|---|---|
+| ![The 3D galaxy view — five projects orbiting the agent](docs/media/galaxy-view.png) | ![The flat constellation view with the prompt bar](docs/media/constellation-home.png) |
+| The 3D galaxy view — every project a star orbiting the agent | The flat constellation view; type a prompt or tap the orb to talk |
+| ![A tool-permission prompt with Allow / Deny buttons](docs/media/tool-permission.png) | ![Two terminals working in parallel while a file is open with a highlighted issue](docs/media/agent-working.png) |
+| Nothing runs without you: every tool call surfaces an Allow / Deny prompt (and lands in the audit log) | Multitasking: two project terminals work in parallel while the agent flags a hardcoded key for your review |
+
+The shots above are a real session against a demo workspace ([higher-quality video](docs/media/axel-demo.mp4)).
+
+---
+
 ## Requirements
 
 | | |
